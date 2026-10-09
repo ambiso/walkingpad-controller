@@ -138,6 +138,24 @@
             flakeIgnore = [ "E501" ];
           } (builtins.readFile ./nix/wp_client.py);
 
+          # Shell completions for the client, generated from its argparse
+          # parser at build time (shtab) so they cannot drift from the
+          # CLI. shtab is a build-time dependency only; the client stays
+          # pure standard library.
+          walkingpad-client-completions = pkgs.stdenv.mkDerivation {
+            pname = "walkingpad-client-completions";
+            version = "0.1.0";
+            src = ./nix;
+            nativeBuildInputs = [
+              (pkgs.python3.withPackages (ps: [ ps.shtab ]))
+            ];
+            dontConfigure = true;
+            dontInstall = true;
+            buildPhase = ''
+              python generate-completions.py $out
+            '';
+          };
+
           # GNOME Shell extension: a Quick Settings toggle + speed slider
           # fed by the daemon's watch stream. No build step; the extension
           # is plain ESM JavaScript plus a metadata file and a symbolic
@@ -182,7 +200,11 @@
           walkingpad-controller = pkgs.python3Packages.walkingpad-controller;
           walkingpad-cli = walkingpad-cli;
           walkingpad-daemon = walkingpad-daemon;
-          walkingpad-client = walkingpad-client;
+          # The client with fish/bash/zsh completions merged in.
+          walkingpad-client = pkgs.buildEnv {
+            name = "walkingpad-client";
+            paths = [ walkingpad-client walkingpad-client-completions ];
+          };
           walkingpad-gnome-extension = walkingpad-gnome-extension;
           walkingpad-sandboxed = walkingpad-sandboxed;
           default = walkingpad-sandboxed;

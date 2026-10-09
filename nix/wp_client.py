@@ -106,7 +106,7 @@ def build_request(args):
     raise AssertionError(args.command)
 
 
-def parse_args():
+def build_parser():
     parser = argparse.ArgumentParser(
         prog="walkingpad-client",
         description="Control the walkingpad daemon (persistent WalkingPad link)")
@@ -131,7 +131,11 @@ def parse_args():
     p_hist.add_argument("--all", action="store_true",
                         help="also count non-final records "
                              "(only for inspection)")
-    return parser.parse_args()
+    return parser
+
+
+def parse_args():
+    return build_parser().parse_args()
 
 
 def main():
