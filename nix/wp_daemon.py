@@ -162,12 +162,6 @@ class Pad:
         self.history_failed = False
         self.pause_pending = False
         self.last_flush = 0.0
-        # Reconnect contention state: _had_link gates the stale-connection
-        # fixup (see connect_once) so a fresh daemon does not instantly
-        # steal the pad from the phone app; _scan_failures lets it win
-        # that contention eventually.
-        self._had_link = False
-        self._scan_failures = 0
         # Session accounting: stats are accumulated per telemetry frame
         # (see _on_telemetry), never taken from the counters' absolute
         # values, so counter wraps and session finalizes need no special
@@ -679,27 +673,19 @@ class Pad:
     async def connect_once(self):
         device = await find_device(self.address, self.prefix)
         if device is None:
-            if self.address:
-                # Scan found nothing. If this daemon held the pad's link
-                # before in this process, or the scan keeps failing,
-                # bluetoothd may be sitting on a stale connection that
-                # keeps the pad from advertising; drop it via BlueZ and
-                # let the next retry take over. The failure count spares a
-                # healthy phone-app connection on a fresh daemon start;
-                # after enough failures the daemon wins the contention,
-                # matching the module's single-owner policy.
-                self._scan_failures += 1
-                if self._had_link or self._scan_failures >= 10:
-                    if await bluez_force_disconnect(self.address):
-                        print("walkingpad: dropped stale BlueZ connection "
-                              "to %s" % self.address, file=sys.stderr)
-                        self._scan_failures = 0
+            # The pad does not advertise while a GATT connection exists,
+            # so a failed scan means either the pad is off or something
+            # still holds its link (a stale one bluetoothd never tore
+            # down, or a phone-app session). The daemon owns the pad
+            # (module policy), so drop it either way and let the next
+            # retry connect; with nothing connected this is a no-op.
+            if self.address and await bluez_force_disconnect(self.address):
+                print("walkingpad: dropped stale BlueZ connection "
+                      "to %s" % self.address, file=sys.stderr)
             raise RuntimeError("no WalkingPad found (is it powered on?)")
-        self._scan_failures = 0
         name = device.name
         client = BleakClient(device)
         await client.connect()
-        self._had_link = True
         self._set(device={"address": device.address, "name": name})
         self.client = client
         self._set(connected=True)
@@ -756,14 +742,18 @@ class Pad:
                     try:
                         await self.client.disconnect()
                     except Exception as exc:
-                        # bluetoothd can refuse (or the link may already be
-                        # half-dead), leaving a stale connection that
-                        # blocks discovery; the direct-connect fallback in
-                        # connect_once recovers from that on the next
-                        # attempt. Log it so the situation is visible.
                         print("walkingpad: disconnect after failure "
                               "errored: %s" % exc, file=sys.stderr)
                     self.client = None
+                    # Any connection bluetoothd still holds to the pad at
+                    # this point is this daemon's own leak, and the pad
+                    # will not advertise while it exists — drop it now so
+                    # the next scan can find the pad.
+                    if self.address and await bluez_force_disconnect(
+                            self.address):
+                        print("walkingpad: dropped leftover BlueZ "
+                              "connection to %s"
+                              % self.address, file=sys.stderr)
                 self._set(connected=False, unlocked=False, control=False,
                           belt="unknown")
                 await asyncio.sleep(self.reconnect_delay)
