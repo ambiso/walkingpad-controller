@@ -152,6 +152,7 @@ class Pad:
             "connected": False,
             "unlocked": False,
             "control": False,
+            "starting": False,
             "belt": "unknown",
             "speed": 0.0,
             "distance": 0,
@@ -165,6 +166,11 @@ class Pad:
 
     def _set(self, **changes):
         belt_before = self.state["belt"]
+        # The pad counts down ~3 s between an accepted start and the belt
+        # actually moving; any belt transition out of "unknown" ends that
+        # window, whatever notification carries it.
+        if self.state.get("starting") and changes.get("belt") is not None:
+            changes["starting"] = False
         self.state.update(changes)
         # Entering "stopped" (machine-status frame: user stop, safety
         # stop, daemon command) finalizes the pad session. The previous
@@ -554,14 +560,27 @@ class Pad:
         if self.state["belt"] == "started":
             return await self.cmd_speed(speed) if speed else 1
         result = await self.cp(OP_START)
-        if result == 1 and speed:
-            # The pad ramps to minimum speed first; retargeting too early is
-            # unreliable, so wait for telemetry to report speed > 0 plus a
-            # stabilization period, like the library does.
-            await self._wait(lambda: self.state["speed"] > 0, 5.0)
-            await asyncio.sleep(1.0)
-            result = await self.cmd_speed(speed)
+        if result == 1:
+            # Accepted: the pad now counts down ~3 s before the belt moves.
+            # Surface that window so clients don't look dead; the flag
+            # clears on the machine-status "started" frame (or any belt
+            # change) and, if that frame is missed, via the watchdog.
+            self._set(starting=True)
+            asyncio.get_running_loop().create_task(self._starting_watchdog())
+            if speed:
+                # The pad ramps to minimum speed first; retargeting too
+                # early is unreliable, so wait for telemetry to report
+                # speed > 0 plus a stabilization period, like the library
+                # does.
+                await self._wait(lambda: self.state["speed"] > 0, 5.0)
+                await asyncio.sleep(1.0)
+                result = await self.cmd_speed(speed)
         return result
+
+    async def _starting_watchdog(self):
+        await asyncio.sleep(8.0)
+        if self.state.get("starting") and self.state["belt"] != "started":
+            self._set(starting=False)
 
     async def cmd_speed(self, speed):
         # Belt refuses speed writes while stopped; clamp to the reported
