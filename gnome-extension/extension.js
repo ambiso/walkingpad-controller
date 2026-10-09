@@ -26,11 +26,10 @@ const RECONNECT_SECONDS = 3;
 // short delay also coalesces a drag into one command.
 const SPEED_COMMIT_MS = 500;
 
-// Session history written by the daemon (one JSON line per finalized
-// session) plus the live snapshot of the open session. Both are 0644 in a
-// 0755 StateDirectory, so the user-session shell can read them directly.
-const HISTORY_PATH = '/var/lib/walkingpad/history.jsonl';
-const CURRENT_PATH = '/var/lib/walkingpad/current.json';
+// Session history served by the daemon over the control socket
+// ({"cmd": "history"}): the state directory belongs to the service's
+// dynamic user and is not readable by the user session, so the files
+// are never read directly.
 const HISTORY_DAYS = 7;
 const HISTORY_REFRESH_SECONDS = 300;
 
@@ -50,7 +49,7 @@ function isoLocalDate(d) {
     return d.getFullYear() + '-' + pad(d.getMonth() + 1) + '-' + pad(d.getDate());
 }
 
-function readDayTotals() {
+function aggregateHistory(reply) {
     const days = [];
     const byDate = new Map();
     const now = new Date();
@@ -66,42 +65,27 @@ function readDayTotals() {
         days.push(day);
         byDate.set(day.date, day);
     }
-    // Finalized sessions; "pause" records overlap their session's stop
-    // record and would double-count, so they are skipped.
-    try {
-        const [, text] = GLib.file_get_contents(HISTORY_PATH);
-        for (const line of decoder.decode(text).split('\n')) {
-            if (!line.trim())
-                continue;
-            try {
-                const rec = JSON.parse(line);
-                if (rec.reason !== 'stop')
-                    continue;
-                const day = byDate.get(rec.date);
-                if (day) {
-                    day.steps += rec.steps || 0;
-                    day.meters += rec.distance || 0;
-                }
-            } catch (e) {
-                // skip malformed line
-            }
+    // Finalized sessions; non-"stop" reasons overlap their session and
+    // would double-count, so they are skipped.
+    for (const rec of (reply && reply.history) || []) {
+        if (rec.reason !== 'stop')
+            continue;
+        const day = byDate.get(rec.date);
+        if (day) {
+            day.steps += rec.steps || 0;
+            day.meters += rec.distance || 0;
         }
-    } catch (e) {
-        // no history yet
     }
     // The open session counts toward today (it is real activity even
     // though the pad has not finalized it).
-    try {
-        const [, text] = GLib.file_get_contents(CURRENT_PATH);
-        const cur = JSON.parse(decoder.decode(text));
-        const day = byDate.get(cur.date);
+    const cur = reply && reply.current;
+    if (cur) {
         const sess = cur.session || {};
+        const day = byDate.get(cur.date);
         if (day) {
             day.steps += sess.steps || 0;
             day.meters += sess.distance || 0;
         }
-    } catch (e) {
-        // no open session
     }
     return days;
 }
@@ -208,10 +192,11 @@ class DaemonLink {
         });
     }
 
-    command(request) {
+    command(request, onReply) {
         // The watch connection never reads again, so commands travel on
         // their own short-lived connection (the daemon serves each client
-        // in a loop of readline/dispatch).
+        // in a loop of readline/dispatch). onReply, when given, receives
+        // the full reply object.
         const client = new Gio.SocketClient();
         client.connect_async(Gio.UnixSocketAddress.new(SOCKET_PATH), null, (c, res) => {
             let conn = null;
@@ -238,6 +223,8 @@ class DaemonLink {
                         const msg = JSON.parse(decoder.decode(line));
                         if (msg && msg.state)
                             this._onState(msg.state);
+                        if (onReply)
+                            onReply(msg);
                     }
                 } catch (e) {
                     // Reply lost; the watch stream resyncs the UI anyway.
@@ -264,6 +251,10 @@ class WalkingPadIndicator extends QuickSettings.SystemIndicator {
         this._reconnectTimeout = 0;
         this._syncing = false;
         this._destroyed = false;
+        this._pendingSpeed = null;   // slider value awaiting pad confirmation
+        this._pendingSince = 0;
+        this._countdown = 0;         // client-side 3-2-1 start countdown
+        this._countdownTimeout = 0;
 
         const gicon = Gio.icon_new_for_string(
             extensionDir + '/icons/walkingpad-symbolic.svg');
@@ -303,9 +294,12 @@ class WalkingPadIndicator extends QuickSettings.SystemIndicator {
         this._hoveredDay = -1;
         this._historyTimeout = 0;
         this._historyBox = this._buildHistogram();
-        this.quickSettingsItems.push(this._historyBox);
 
         Main.panel.statusArea.quickSettings.addExternalIndicator(this);
+        // The histogram spans the full 2-column quick settings grid; as a
+        // one-column item its fixed width would inflate every column (the
+        // grid sizes columns to the widest child), skewing the layout.
+        Main.panel.statusArea.quickSettings.menu.addItem(this._historyBox, 2);
 
         this._link = new DaemonLink(
             state => this._onState(state),
@@ -318,10 +312,49 @@ class WalkingPadIndicator extends QuickSettings.SystemIndicator {
         const running = this._running();
         const target = !running;
         this._toggle.checked = target;
-        if (target)
+        if (target) {
+            this._startCountdown();
             this._link.command({cmd: 'start', speed: this._targetSpeed()});
-        else
+        } else {
             this._link.command({cmd: 'stop'});
+        }
+    }
+
+    // The pad counts down ~3 s after an accepted start before the belt
+    // moves. Waiting for the daemon's state to catch up would leave the
+    // toggle feeling dead for that window, so the countdown runs locally
+    // from the click; the daemon's "starting" flag and the running state
+    // take over seamlessly when they arrive.
+    _startCountdown() {
+        this._clearCountdown();
+        this._countdown = 3;
+        this._countdownTick();
+        this._countdownTimeout = GLib.timeout_add_seconds(
+            GLib.PRIORITY_DEFAULT, 1, () => {
+                this._countdown -= 1;
+                if (this._countdown <= 0) {
+                    this._countdownTimeout = 0;
+                    this._countdown = 0;
+                    if (this._state)
+                        this._toggle.subtitle =
+                            this._subtitle(this._state, this._running());
+                    return GLib.SOURCE_REMOVE;
+                }
+                this._countdownTick();
+                return GLib.SOURCE_CONTINUE;
+            });
+    }
+
+    _countdownTick() {
+        this._toggle.subtitle = `starting in ${this._countdown}…`;
+    }
+
+    _clearCountdown() {
+        if (this._countdownTimeout) {
+            GLib.source_remove(this._countdownTimeout);
+            this._countdownTimeout = 0;
+        }
+        this._countdown = 0;
     }
 
     _targetSpeed() {
@@ -354,8 +387,24 @@ class WalkingPadIndicator extends QuickSettings.SystemIndicator {
 
     _commitSpeed() {
         this._speed = this._targetSpeed();
+        // Hold the committed speed optimistically until the pad reports
+        // it (or the commit is presumed lost); snapping back to the
+        // stale state for ~1 s reads as a rejected drag.
+        this._pendingSpeed = this._speed;
+        this._pendingSince = GLib.get_monotonic_time();
         // "speed" starts the belt if it is stopped, matching the CLI.
         this._link.command({cmd: 'speed', speed: this._speed});
+    }
+
+    _displaySpeed(state) {
+        if (this._pendingSpeed !== null) {
+            if ((GLib.get_monotonic_time() - this._pendingSince) > 5000) {
+                this._pendingSpeed = null;  // presumed lost; the pad wins
+            } else {
+                return this._pendingSpeed;
+            }
+        }
+        return state.speed;
     }
 
     _running() {
@@ -373,12 +422,13 @@ class WalkingPadIndicator extends QuickSettings.SystemIndicator {
     // that day's exact steps and distance.
 
     _buildHistogram() {
-        const CHART_W = 200;
         const CHART_H = 56;
         const GAP = 5;
 
+        // The chart expands to whatever width the 2-column grid gives it;
+        // the painter reads the actual allocation on every repaint.
         this._chart = new St.DrawingArea({
-            width: CHART_W,
+            x_expand: true,
             height: CHART_H,
         });
         this._chart._barLayout = w => {
@@ -435,6 +485,7 @@ class WalkingPadIndicator extends QuickSettings.SystemIndicator {
 
         const box = new St.BoxLayout({
             vertical: true,
+            x_expand: true,
             style: 'padding: 10px 12px 8px 12px;',
         });
         box.add_child(this._chart);
@@ -472,11 +523,28 @@ class WalkingPadIndicator extends QuickSettings.SystemIndicator {
     _refreshHistory() {
         if (this._destroyed)
             return;
-        try {
-            this._days = readDayTotals();
-        } catch (e) {
-            this._days = [];
-        }
+        this._link.command({cmd: 'history'}, reply => {
+            if (this._destroyed)
+                return;
+            try {
+                this._days = reply && reply.ok
+                    ? aggregateHistory(reply) : [];
+            } catch (e) {
+                this._days = [];
+            }
+            this._applyHistory();
+        });
+        if (this._historyTimeout)
+            GLib.source_remove(this._historyTimeout);
+        this._historyTimeout = GLib.timeout_add_seconds(
+            GLib.PRIORITY_DEFAULT, HISTORY_REFRESH_SECONDS, () => {
+                this._historyTimeout = 0;
+                this._refreshHistory();
+                return GLib.SOURCE_REMOVE;
+            });
+    }
+
+    _applyHistory() {
         for (let i = 0; i < HISTORY_DAYS; i++) {
             const day = this._days[i];
             if (day && this._weekdayLabels && this._weekdayLabels[i]) {
@@ -490,14 +558,6 @@ class WalkingPadIndicator extends QuickSettings.SystemIndicator {
         this._updateHistoryCaption();
         if (this._chart)
             this._chart.queue_repaint();
-        if (this._historyTimeout)
-            GLib.source_remove(this._historyTimeout);
-        this._historyTimeout = GLib.timeout_add_seconds(
-            GLib.PRIORITY_DEFAULT, HISTORY_REFRESH_SECONDS, () => {
-                this._historyTimeout = 0;
-                this._refreshHistory();
-                return GLib.SOURCE_REMOVE;
-            });
     }
 
     _updateHistoryCaption() {
@@ -507,16 +567,26 @@ class WalkingPadIndicator extends QuickSettings.SystemIndicator {
             this._caption.text =
                 `${hovered.date}: ${hovered.steps.toLocaleString()} steps · ${km} km`;
         } else {
-            const total = this._days.reduce((sum, d) => sum + (d.steps || 0), 0);
-            this._caption.text = total > 0
-                ? `steps · last ${HISTORY_DAYS} days: ${total.toLocaleString()}`
-                : 'no history yet';
+            // Default: today's totals, so the distance has a persistent
+            // place (the toggle subtitle is too tight for it).
+            const today = this._days[this._days.length - 1];
+            if (today && (today.steps > 0 || today.meters > 0)) {
+                const km = (today.meters / 1000).toFixed(2);
+                this._caption.text =
+                    `today: ${km} km · ${today.steps.toLocaleString()} steps`;
+            } else {
+                this._caption.text = 'no history yet';
+            }
         }
     }
 
     _onState(state) {
         this._state = state;
         const running = this._running();
+        // The pad confirmed the start: the local countdown has served its
+        // purpose and the live stats take over.
+        if (running)
+            this._clearCountdown();
         // A running->stopped transition finalized a session: the history
         // gained a record, so the histogram is stale.
         if (!running && this._wasRunning)
@@ -529,26 +599,35 @@ class WalkingPadIndicator extends QuickSettings.SystemIndicator {
         if (state.max_speed !== null && state.max_speed > this._lo)
             this._hi = state.max_speed;
 
-        // Reflect the pad in the slider unless the user is dragging it.
-        if (running && !this._dragging &&
+        // Reflect the pad in the slider unless the user is dragging it or
+        // a committed speed is still awaiting confirmation.
+        if (running && !this._dragging && this._pendingSpeed === null &&
             Math.abs(this._targetSpeed() - state.speed) > 0.05)
             this._setSliderSpeed(state.speed);
 
-        this._toggle.checked = running;
+        this._toggle.checked = running || state.starting === true;
         this._toggle.subtitle = this._subtitle(state, running);
         this._icon.opacity = running ? 255 : (state.connected ? 160 : 80);
     }
 
     _subtitle(state, running) {
+        if (this._countdown > 0)
+            return `starting in ${this._countdown}…`;
+        if (state.starting)
+            // The pad counts down ~3 s after an accepted start command
+            // before the belt moves; without this the toggle looks dead.
+            return 'starting…';
         if (!state.connected)
             return 'pad not connected';
+        // Keep this short: the Quick Settings column ellipsizes around 30
+        // characters, so distance stays out (it is shown by the histogram
+        // caption on hover and by `walkingpad-client history`).
         const time = this._formatDuration(state.elapsed);
         const steps = `${state.steps} steps`;
-        const km = `${(state.distance / 1000).toFixed(2)} km`;
         if (!running)
-            return `stopped · ${time} · ${steps} · ${km}`;
-        const speed = `${state.speed.toFixed(1)} km/h`;
-        return `${speed} · ${time} · ${steps} · ${km}`;
+            return `stopped · ${time} · ${steps}`;
+        const speed = `${this._displaySpeed(state).toFixed(1)} km/h`;
+        return `${speed} · ${time} · ${steps}`;
     }
 
     // Session seconds as h:mm:ss, or m:ss under an hour. Matches how the
@@ -583,6 +662,7 @@ class WalkingPadIndicator extends QuickSettings.SystemIndicator {
     destroy() {
         this._destroyed = true;
         this._link.stop();
+        this._clearCountdown();
         if (this._commitTimeout)
             GLib.source_remove(this._commitTimeout);
         if (this._reconnectTimeout)
