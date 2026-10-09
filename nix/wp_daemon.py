@@ -69,6 +69,22 @@ RESULT_TEXT = {
 
 WRITE_PACE = 0.4  # both channels silently drop writes closer than 400 ms
 
+
+class ReconnectRequested(Exception):
+    """Raised to drop the current link and reconnect without delay."""
+
+
+def _queue_start(pad, request):
+    # A start pressed while the pad is unreachable (standby dropped the
+    # link, or bluetoothd holds a stale one) should not be lost: queue
+    # it, flag the state stream so clients show "starting…" through the
+    # reconnect window, and wake the reconnect loop immediately.
+    pad.pending_start = {"speed": request.get("speed")}
+    pad._set(starting=True)
+    pad.reconnect_now.set()
+    asyncio.get_running_loop().create_task(pad._starting_watchdog())
+
+
 FLUSH_INTERVAL = 5.0  # min seconds between current.json rewrites
 
 # Session stats are accumulated as deltas between consecutive telemetry
@@ -183,6 +199,11 @@ class Pad:
         # last raw counters seen. The first telemetry frame after startup
         # resolves it with the same delta rule as everything else.
         self.recovery = self._read_current()
+        # Immediate-reconnect request (a start pressed while the pad is
+        # in standby must not wait for the keepalive to notice the dead
+        # link), and a start queued across that reconnect.
+        self.reconnect_now = asyncio.Event()
+        self.pending_start = None
         self.client = None
         self.vendor_lock = asyncio.Lock()
         self.vendor_reply = None
@@ -638,8 +659,41 @@ class Pad:
                 result = await self.cmd_speed(speed)
         return result
 
+    async def _idle_wait(self, timeout):
+        # Returns True when a reconnect was requested (the caller drops
+        # the link and reconnects without delay), False on timeout. The
+        # event is consumed either way.
+        try:
+            await asyncio.wait_for(self.reconnect_now.wait(), timeout)
+        except asyncio.TimeoutError:
+            return False
+        self.reconnect_now.clear()
+        return True
+
+    def _run_queued_start(self):
+        # Runs after "pad ready": a start that was queued while the pad
+        # was unreachable finally has a live link.
+        if self.pending_start is None:
+            return
+        queued = self.pending_start
+        self.pending_start = None
+
+        async def run():
+            try:
+                result = await self.cmd_start(queued["speed"])
+                if result != 1:
+                    print("walkingpad: queued start refused (result %s)"
+                          % result, file=sys.stderr)
+            except Exception as exc:
+                print("walkingpad: queued start failed: %s" % exc,
+                      file=sys.stderr)
+
+        asyncio.get_running_loop().create_task(run())
+
     async def _starting_watchdog(self):
-        await asyncio.sleep(8.0)
+        # 30 s covers a full reconnect (scan timeout 10 s + retry) plus
+        # the pad's ~3 s countdown; the flag clears on any belt change.
+        await asyncio.sleep(30.0)
         if self.state.get("starting") and self.state["belt"] != "started":
             self._set(starting=False)
 
@@ -728,16 +782,20 @@ class Pad:
             print("walkingpad: WARNING control not granted yet; commands may "
                   "be refused until it is", file=sys.stderr)
         print("walkingpad: pad ready", file=sys.stderr)
+        self._run_queued_start()
         # Keepalive: a silent property read every keepalive seconds surfaces
         # dead links quickly (the write raises once bluetoothd notices) and
-        # keeps idle connections from being dropped.
+        # keeps idle connections from being dropped. A reconnect request
+        # interrupts the idle wait and drops the link immediately.
         while True:
             if self.keepalive > 0:
-                await asyncio.sleep(self.keepalive)
+                if await self._idle_wait(self.keepalive):
+                    raise ReconnectRequested()
                 await self.vendor_request(
                     ks_frame(0x72, 0x00, [0x00]), expect=b"\x72\x80", timeout=10.0)
             else:
-                await asyncio.sleep(3600.0)
+                if await self._idle_wait(3600.0):
+                    raise ReconnectRequested()
 
     async def run(self):
         while True:
@@ -746,8 +804,11 @@ class Pad:
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
-                print("walkingpad: %s; reconnecting in %.0fs"
-                      % (exc, self.reconnect_delay), file=sys.stderr)
+                immediate = isinstance(exc, ReconnectRequested)
+                print("walkingpad: %s; reconnecting %s"
+                      % (exc, "immediately" if immediate
+                         else "in %.0fs" % self.reconnect_delay),
+                      file=sys.stderr)
                 if self.client is not None:
                     try:
                         await self.client.disconnect()
@@ -766,7 +827,8 @@ class Pad:
                               % self.address, file=sys.stderr)
                 self._set(connected=False, unlocked=False, control=False,
                           belt="unknown")
-                await asyncio.sleep(self.reconnect_delay)
+                if not immediate:
+                    await self._idle_wait(self.reconnect_delay)
 
 
 async def dispatch(pad, request):
@@ -781,14 +843,33 @@ async def dispatch(pad, request):
                 "current": pad._read_current()}
     if cmd == "watch":
         return {"ok": True, "state": pad.state}
+    if cmd == "reconnect":
+        # Drop the current link (if any) and reconnect without delay —
+        # e.g. when the pad went into standby and the client knows it
+        # needs a fresh link now rather than at the next keepalive.
+        pad.reconnect_now.set()
+        return {"ok": True, "state": pad.state}
     if not pad.state["connected"]:
+        if cmd == "start":
+            # Queue the start across the reconnect; the state stream
+            # reports starting=true, so clients keep their countdown
+            # honest. The reconnect itself wakes immediately.
+            _queue_start(pad, request)
+            return {"ok": True, "queued": "start", "state": pad.state}
         return {"ok": False, "error": "pad not connected", "state": pad.state}
     if cmd == "status":
         return {"ok": True, "state": pad.state}
     if cmd == "properties":
         return {"ok": True, "properties": await pad.read_properties()}
     if cmd == "start":
-        result = await pad.cmd_start(request.get("speed"))
+        try:
+            result = await pad.cmd_start(request.get("speed"))
+        except Exception:
+            # The link died mid-command (the pad's standby can drop it
+            # silently): re-queue the start and reconnect now instead
+            # of losing the press.
+            _queue_start(pad, request)
+            return {"ok": True, "queued": "start", "state": pad.state}
     elif cmd == "speed":
         try:
             result = await pad.cmd_speed(request["speed"])

@@ -99,6 +99,8 @@ def build_request(args):
         return {"cmd": "stop"}, False
     if args.command == "pause":
         return {"cmd": "pause"}, False
+    if args.command == "reconnect":
+        return {"cmd": "reconnect"}, False
     if args.command == "set-buzzer":
         return {"cmd": "set-buzzer", "value": args.value}, False
     if args.command == "history":
@@ -123,6 +125,8 @@ def build_parser():
     p_speed.add_argument("speed", type=float, help="speed in km/h")
     sub.add_parser("stop", help="stop the belt (finalizes the pad session)")
     sub.add_parser("pause", help="pause the belt (keeps the session open)")
+    sub.add_parser("reconnect",
+                   help="drop the link and reconnect immediately (e.g. pad standby)")
     p_buzzer = sub.add_parser("set-buzzer", help="toggle the pad's buzzer bit")
     p_buzzer.add_argument("value", choices=["on", "off"])
     p_hist = sub.add_parser("history", help="per-day distance/duration/steps totals")
