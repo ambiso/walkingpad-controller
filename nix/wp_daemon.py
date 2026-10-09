@@ -112,7 +112,39 @@ async def find_device(address=None, prefix="KS-", timeout=10.0):
     return await BleakScanner.find_device_by_filter(match, timeout=timeout)
 
 
-GAP_NAME = "00002a00-0000-1000-8000-00805f9b34fb"  # Device Name (GAP)
+async def bluez_force_disconnect(address):
+    # The pad does not advertise while a GATT connection exists, and
+    # bleak cannot connect to a bare address that is not advertising, so
+    # a stale connection bluetoothd never tore down blocks discovery
+    # forever. This is the org.bluez.Device1 Disconnect call (what
+    # bluetoothctl does), made over the system bus so the daemon can
+    # clear its own leaked links. Best-effort: returns True only when a
+    # connected device with that address was found and disconnected.
+    try:
+        from dbus_fast import BusType, Message
+        from dbus_fast.aio import MessageBus
+    except ImportError:
+        return False
+    bus = await MessageBus(bus_type=BusType.SYSTEM).connect()
+    try:
+        reply = await bus.call(Message(
+            destination="org.bluez", path="/",
+            interface="org.freedesktop.DBus.ObjectManager",
+            member="GetManagedObjects"))
+        objects = reply.body[0] if reply.body else {}
+        for path, interfaces in objects.items():
+            props = (interfaces or {}).get("org.bluez.Device1")
+            if not props or props.get("Address") != address:
+                continue
+            if not props.get("Connected"):
+                continue
+            await bus.call(Message(
+                destination="org.bluez", path=path,
+                interface="org.bluez.Device1", member="Disconnect"))
+            return True
+    finally:
+        bus.disconnect()
+    return False
 
 
 class Pad:
@@ -130,6 +162,12 @@ class Pad:
         self.history_failed = False
         self.pause_pending = False
         self.last_flush = 0.0
+        # Reconnect contention state: _had_link gates the stale-connection
+        # fixup (see connect_once) so a fresh daemon does not instantly
+        # steal the pad from the phone app; _scan_failures lets it win
+        # that contention eventually.
+        self._had_link = False
+        self._scan_failures = 0
         # Session accounting: stats are accumulated per telemetry frame
         # (see _on_telemetry), never taken from the counters' absolute
         # values, so counter wraps and session finalizes need no special
@@ -640,34 +678,29 @@ class Pad:
 
     async def connect_once(self):
         device = await find_device(self.address, self.prefix)
-        client = None
-        if device is not None:
-            name = device.name
-            client = BleakClient(device)
-            await client.connect()
-        elif self.address:
-            # The pad does not advertise while a GATT connection exists —
-            # including a stale one that bluetoothd never tore down after a
-            # link failure, which blocks discovery forever (the reconnect
-            # loop then deadlocks against its own leftover connection). A
-            # direct connect resolves both cases: it hands us the live pad
-            # or the stale connection, which this daemon then owns and can
-            # disconnect properly on the next failure.
-            print("walkingpad: scan found nothing; trying direct connect "
-                  "to %s" % self.address, file=sys.stderr)
-            client = BleakClient(self.address)
-            await client.connect()
-            try:
-                name = bytes(await client.read_gatt_char(GAP_NAME)).decode(
-                    errors="replace").strip("\x00 ")
-            except Exception:
-                # The vendor unlock token needs the last four chars of the
-                # advertised name; reuse the one learned from a previous
-                # connection, if any.
-                name = (self.state.get("device") or {}).get("name") or "KS-"
-        else:
+        if device is None:
+            if self.address:
+                # Scan found nothing. If this daemon held the pad's link
+                # before in this process, or the scan keeps failing,
+                # bluetoothd may be sitting on a stale connection that
+                # keeps the pad from advertising; drop it via BlueZ and
+                # let the next retry take over. The failure count spares a
+                # healthy phone-app connection on a fresh daemon start;
+                # after enough failures the daemon wins the contention,
+                # matching the module's single-owner policy.
+                self._scan_failures += 1
+                if self._had_link or self._scan_failures >= 10:
+                    if await bluez_force_disconnect(self.address):
+                        print("walkingpad: dropped stale BlueZ connection "
+                              "to %s" % self.address, file=sys.stderr)
+                        self._scan_failures = 0
             raise RuntimeError("no WalkingPad found (is it powered on?)")
-        self._set(device={"address": client.address, "name": name})
+        self._scan_failures = 0
+        name = device.name
+        client = BleakClient(device)
+        await client.connect()
+        self._had_link = True
+        self._set(device={"address": device.address, "name": name})
         self.client = client
         self._set(connected=True)
         print("walkingpad: connected to %s (%s)" % (device.name, device.address),
