@@ -281,6 +281,10 @@ class WalkingPadIndicator extends QuickSettings.SystemIndicator {
         this._hi = 6.0;
         this._dragging = false;
         this._sliderItem = new QuickSettings.QuickSlider();
+        // GNOME 50's QuickSlider has no visible text slot (icon-label is
+        // the accessible name), so the slider gets the icon like the
+        // volume slider, and the speed lives in the histogram caption.
+        this._sliderItem.gicon = gicon;
         this._slider = this._sliderItem.slider;
         this._slider.connect('drag-begin', () => { this._dragging = true; });
         this._slider.connect('drag-end', () => {
@@ -398,7 +402,11 @@ class WalkingPadIndicator extends QuickSettings.SystemIndicator {
 
     _displaySpeed(state) {
         if (this._pendingSpeed !== null) {
-            if ((GLib.get_monotonic_time() - this._pendingSince) > 5000) {
+            // Clear the hold the moment the pad confirms the speed (or
+            // after a real 5 s — get_monotonic_time is microseconds).
+            if (Math.abs(state.speed - this._pendingSpeed) <= 0.05 ||
+                GLib.get_monotonic_time() - this._pendingSince
+                    > 5 * GLib.USEC_PER_SEC) {
                 this._pendingSpeed = null;  // presumed lost; the pad wins
             } else {
                 return this._pendingSpeed;
@@ -574,8 +582,9 @@ class WalkingPadIndicator extends QuickSettings.SystemIndicator {
                 `${hovered.date}: ${hovered.steps.toLocaleString()} steps · ${km} km`;
         } else if (running && state) {
             const km = (state.distance / 1000).toFixed(2);
-            this._caption.text =
-                `${this._formatDuration(state.elapsed)} · ${state.steps.toLocaleString()} steps · ${km} km`;
+            this._caption.text = `${this._displaySpeed(state).toFixed(1)} km/h · `
+                + `${this._formatDuration(state.elapsed)} · `
+                + `${state.steps.toLocaleString()} steps · ${km} km`;
         } else {
             const today = this._days[this._days.length - 1];
             if (today && (today.steps > 0 || today.meters > 0)) {
@@ -615,10 +624,11 @@ class WalkingPadIndicator extends QuickSettings.SystemIndicator {
 
         this._toggle.checked = running || state.starting === true;
         this._toggle.subtitle = this._subtitle(state, running);
-        // The slider's native icon label carries the speed (like the
-        // volume slider's percentage).
-        this._sliderItem.iconLabel = running
-            ? `${this._displaySpeed(state).toFixed(1)} km/h` : '';
+        // icon-label is the slider's accessible name — GNOME 50's
+        // QuickSlider has no visible text slot; the speed shows in the
+        // histogram caption line below.
+        this._sliderItem.iconLabel =
+            `${this._displaySpeed(state).toFixed(1)} km/h`;
         this._updateCaption(state, running);
         this._icon.opacity = running ? 255 : (state.connected ? 160 : 80);
     }
