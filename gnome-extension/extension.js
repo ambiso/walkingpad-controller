@@ -271,7 +271,6 @@ class WalkingPadIndicator extends QuickSettings.SystemIndicator {
         });
         this._toggle.gicon = gicon;
         this._toggle.connect('clicked', () => this._onToggleClicked());
-        this.quickSettingsItems.push(this._toggle);
 
         // GNOME 50's QuickSlider wraps a normalized (0..1) Slider exposed
         // as .slider; speed is mapped into that range from the pad's
@@ -282,9 +281,10 @@ class WalkingPadIndicator extends QuickSettings.SystemIndicator {
         this._dragging = false;
         this._sliderItem = new QuickSettings.QuickSlider();
         // GNOME 50's QuickSlider has no visible text slot (icon-label is
-        // the accessible name), so the slider gets the icon like the
-        // volume slider, and the speed lives in the histogram caption.
-        this._sliderItem.gicon = gicon;
+        // the accessible name), so the slider gets a themed icon like the
+        // volume slider — media-seek-forward-symbolic, the tape-deck
+        // ">>" — and the speed lives in the histogram caption.
+        this._sliderItem.iconName = 'media-seek-forward-symbolic';
         this._slider = this._sliderItem.slider;
         this._slider.connect('drag-begin', () => { this._dragging = true; });
         this._slider.connect('drag-end', () => {
@@ -292,7 +292,11 @@ class WalkingPadIndicator extends QuickSettings.SystemIndicator {
             this._commitSpeed();
         });
         this._slider.connect('notify::value', () => this._onSliderValue());
+        // The slider comes first in the items list: the grid renders the
+        // second item in the left column, so this puts the WalkingPad
+        // toggle on the left and the speed slider on the right.
         this.quickSettingsItems.push(this._sliderItem);
+        this.quickSettingsItems.push(this._toggle);
 
         this._days = [];
         this._hoveredDay = -1;
@@ -582,9 +586,8 @@ class WalkingPadIndicator extends QuickSettings.SystemIndicator {
                 `${hovered.date}: ${hovered.steps.toLocaleString()} steps · ${km} km`;
         } else if (running && state) {
             const km = (state.distance / 1000).toFixed(2);
-            this._caption.text = `${this._displaySpeed(state).toFixed(1)} km/h · `
-                + `${this._formatDuration(state.elapsed)} · `
-                + `${state.steps.toLocaleString()} steps · ${km} km`;
+            this._caption.text =
+                `${this._formatDuration(state.elapsed)} · ${state.steps.toLocaleString()} steps · ${km} km`;
         } else {
             const today = this._days[this._days.length - 1];
             if (today && (today.steps > 0 || today.meters > 0)) {
@@ -634,17 +637,18 @@ class WalkingPadIndicator extends QuickSettings.SystemIndicator {
     }
 
     _subtitle(state, running) {
-        // State words only: the Quick Settings column ellipsizes around 30
-        // characters, which no stats string survives. The numbers live on
-        // the slider's icon label (speed) and the full-width histogram
-        // caption (duration, steps, distance).
+        // Words + speed fit the ~30-character quick settings column;
+        // the long values (duration, steps, distance) stay on the
+        // full-width histogram caption.
         if (this._countdown > 0)
             return `starting in ${this._countdown}…`;
         if (state.starting)
             return 'starting…';
         if (!state.connected)
             return 'pad not connected';
-        return running ? 'walking' : 'stopped';
+        if (running)
+            return `walking @ ${this._displaySpeed(state).toFixed(1)} km/h`;
+        return 'stopped';
     }
 
     // Session seconds as h:mm:ss, or m:ss under an hour. Matches how the
