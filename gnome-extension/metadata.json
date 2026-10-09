@@ -4,5 +4,5 @@
   "description": "KingSmith WalkingPad control in Quick Settings: a start/stop toggle and a speed slider, fed live by the walkingpad-daemon Unix-socket state stream.",
   "shell-version": ["45", "46", "47", "48", "49", "50"],
   "url": "https://github.com/ambiso/walkingpad-controller",
-  "version": 9
+  "version": 10
 }

@@ -427,9 +427,13 @@ class WalkingPadIndicator extends QuickSettings.SystemIndicator {
 
         // The chart expands to whatever width the 2-column grid gives it;
         // the painter reads the actual allocation on every repaint.
+        // reactive is required for motion/leave events to reach the actor
+        // at all — without it the hover hit-test never fires.
         this._chart = new St.DrawingArea({
             x_expand: true,
             height: CHART_H,
+            reactive: true,
+            track_hover: true,
         });
         this._chart._barLayout = w => {
             // Shared by the painter and the hover hit-test so they can
