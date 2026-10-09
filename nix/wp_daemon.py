@@ -298,6 +298,25 @@ class Pad:
             self.prev_counters[pad_field] = changes[pad_field]
         self._maybe_flush_current()
 
+    def read_history(self):
+        # Served over the control socket (see dispatch): the state
+        # directory belongs to the service's dynamic user and is not
+        # reliably readable by other users.
+        records = []
+        try:
+            with open(self.history_path, encoding="utf-8") as fh:
+                for line in fh:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        records.append(json.loads(line))
+                    except ValueError:
+                        continue
+        except OSError:
+            pass
+        return records
+
     def _append_history(self, record):
         try:
             os.makedirs(self.history_dir, exist_ok=True)
@@ -721,6 +740,12 @@ async def dispatch(pad, request):
     cmd = request.get("cmd")
     if cmd == "ping":
         return {"ok": True}
+    if cmd == "history":
+        # History is served over the socket: the state directory belongs
+        # to the service's dynamic user and is not reliably readable by
+        # other users, so clients must not parse the files directly.
+        return {"ok": True, "history": pad.read_history(),
+                "current": pad._read_current()}
     if cmd == "watch":
         return {"ok": True, "state": pad.state}
     if not pad.state["connected"]:
