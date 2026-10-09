@@ -14,6 +14,7 @@
 import Gio from 'gi://Gio';
 import GLib from 'gi://GLib';
 import GObject from 'gi://GObject';
+import Clutter from 'gi://Clutter';
 import St from 'gi://St';
 import * as Main from 'resource:///org/gnome/shell/ui/main.js';
 import * as QuickSettings from 'resource:///org/gnome/shell/ui/quickSettings.js';
@@ -24,6 +25,88 @@ const RECONNECT_SECONDS = 3;
 // The pad enforces ~400 ms pacing between BLE writes; committing on a
 // short delay also coalesces a drag into one command.
 const SPEED_COMMIT_MS = 500;
+
+// Session history written by the daemon (one JSON line per finalized
+// session) plus the live snapshot of the open session. Both are 0644 in a
+// 0755 StateDirectory, so the user-session shell can read them directly.
+const HISTORY_PATH = '/var/lib/walkingpad/history.jsonl';
+const CURRENT_PATH = '/var/lib/walkingpad/current.json';
+const HISTORY_DAYS = 7;
+const HISTORY_REFRESH_SECONDS = 300;
+
+// GJS binds Cairo's color setters under either casing depending on the
+// gir version; take whichever exists.
+function cairoSetColor(cr, r, g, b, a) {
+    if (typeof cr.setSourceRGBA === 'function')
+        cr.setSourceRGBA(r, g, b, a);
+    else
+        cr.setSourceRgba(r, g, b, a);
+}
+
+// Local calendar date as YYYY-MM-DD — the daemon dates records in local
+// time, and Date.toISOString() would shift everything to UTC.
+function isoLocalDate(d) {
+    const pad = n => String(n).padStart(2, '0');
+    return d.getFullYear() + '-' + pad(d.getMonth() + 1) + '-' + pad(d.getDate());
+}
+
+function readDayTotals() {
+    const days = [];
+    const byDate = new Map();
+    const now = new Date();
+    for (let i = HISTORY_DAYS - 1; i >= 0; i--) {
+        const d = new Date(now.getFullYear(), now.getMonth(), now.getDate() - i);
+        const day = {
+            date: isoLocalDate(d),
+            steps: 0,
+            meters: 0,
+            weekday: d.toLocaleDateString(undefined, {weekday: 'narrow'}),
+            today: i === 0,
+        };
+        days.push(day);
+        byDate.set(day.date, day);
+    }
+    // Finalized sessions; "pause" records overlap their session's stop
+    // record and would double-count, so they are skipped.
+    try {
+        const [, text] = GLib.file_get_contents(HISTORY_PATH);
+        for (const line of decoder.decode(text).split('\n')) {
+            if (!line.trim())
+                continue;
+            try {
+                const rec = JSON.parse(line);
+                if (rec.reason !== 'stop')
+                    continue;
+                const day = byDate.get(rec.date);
+                if (day) {
+                    day.steps += rec.steps || 0;
+                    day.meters += rec.distance || 0;
+                }
+            } catch (e) {
+                // skip malformed line
+            }
+        }
+    } catch (e) {
+        // no history yet
+    }
+    // The open session counts toward today (it is real activity even
+    // though the pad has not finalized it).
+    try {
+        const [, text] = GLib.file_get_contents(CURRENT_PATH);
+        const cur = JSON.parse(decoder.decode(text));
+        const day = byDate.get(cur.date);
+        const sess = cur.session || {};
+        if (day) {
+            day.steps += sess.steps || 0;
+            day.meters += sess.distance || 0;
+        }
+    } catch (e) {
+        // no open session
+    }
+    return days;
+}
+
+const decoder = new TextDecoder();
 
 // Daemon link: watch stream + one-shot commands. Not a GObject; it only
 // needs the two callbacks the indicator provides.
@@ -207,12 +290,19 @@ class WalkingPadIndicator extends QuickSettings.SystemIndicator {
         this._slider = new QuickSettings.QuickSettingsSlider(this._adjustment);
         this.quickSettingsItems.push(this._slider);
 
+        this._days = [];
+        this._hoveredDay = -1;
+        this._historyTimeout = 0;
+        this._historyBox = this._buildHistogram();
+        this.quickSettingsItems.push(this._historyBox);
+
         Main.panel.statusArea.quickSettings.addExternalIndicator(this);
 
         this._link = new DaemonLink(
             state => this._onState(state),
             () => this._onWatchDown());
         this._link.start();
+        this._refreshHistory();
     }
 
     _onToggleClicked() {
@@ -250,9 +340,164 @@ class WalkingPadIndicator extends QuickSettings.SystemIndicator {
             this._state.belt === 'started';
     }
 
+    // -- steps histogram --------------------------------------------------
+    //
+    // Seven bars (oldest left, today right) drawn with Cairo on an
+    // St.DrawingArea, plus a caption line and a weekday label row. Shell
+    // actors have no native tooltips, so hover precision is a hit-test on
+    // motion events: the hovered bar is highlighted and the caption shows
+    // that day's exact steps and distance.
+
+    _buildHistogram() {
+        const CHART_W = 200;
+        const CHART_H = 56;
+        const GAP = 5;
+
+        this._chart = new St.DrawingArea({
+            width: CHART_W,
+            height: CHART_H,
+        });
+        this._chart._barLayout = w => {
+            // Shared by the painter and the hover hit-test so they can
+            // never disagree about where a bar starts.
+            const barW = (w - GAP * (HISTORY_DAYS + 1)) / HISTORY_DAYS;
+            return i => [GAP + i * (barW + GAP), barW];
+        };
+        this._chart.connect('repaint', area => this._paintChart(area));
+
+        this._chart.connect('motion-event', (actor, event) => {
+            const [sx, sy] = event.get_coords();
+            const [ok, ax, ay] = actor.transform_stage_point(sx, sy);
+            if (!ok)
+                return false;
+            const [x0, barW] = actor._barLayout(actor.get_width())(0);
+            const idx = Math.floor((ax - x0) / (barW + GAP));
+            const hovered = idx >= 0 && idx < HISTORY_DAYS ? idx : -1;
+            if (hovered !== this._hoveredDay) {
+                this._hoveredDay = hovered;
+                this._updateHistoryCaption();
+                actor.queue_repaint();
+            }
+            return true;
+        });
+        this._chart.connect('leave-event', () => {
+            if (this._hoveredDay !== -1) {
+                this._hoveredDay = -1;
+                this._updateHistoryCaption();
+                this._chart.queue_repaint();
+            }
+            return true;
+        });
+
+        this._caption = new St.Label({
+            text: 'no history yet',
+            x_align: Clutter.ActorAlign.CENTER,
+            x_expand: true,
+            style: 'font-size: 10pt; padding: 2px 0;',
+        });
+
+        const weekdayRow = new St.BoxLayout({x_expand: true});
+        this._weekdayLabels = this._days.map(() => null); // resized on refresh
+        for (let i = 0; i < HISTORY_DAYS; i++) {
+            const label = new St.Label({
+                text: '',
+                x_align: Clutter.ActorAlign.CENTER,
+                x_expand: true,
+                style: 'font-size: 9pt; padding: 1px 0; color: rgba(200, 200, 200, 0.75);',
+            });
+            this._weekdayLabels[i] = label;
+            weekdayRow.add_child(label);
+        }
+
+        const box = new St.BoxLayout({
+            vertical: true,
+            style: 'padding: 10px 12px 8px 12px;',
+        });
+        box.add_child(this._chart);
+        box.add_child(this._caption);
+        box.add_child(weekdayRow);
+        return box;
+    }
+
+    _paintChart(area) {
+        const cr = area.get_context();
+        const w = area.get_width();
+        const h = area.get_height();
+        const barAt = area._barLayout(w);
+        const maxSteps = Math.max(1, ...this._days.map(d => d.steps));
+        for (let i = 0; i < HISTORY_DAYS; i++) {
+            const day = this._days[i];
+            if (!day)
+                continue;
+            const [x, barW] = barAt(i);
+            const barH = day.steps > 0
+                ? Math.max(3, Math.round((h - 2) * day.steps / maxSteps))
+                : 2;  // zero-day stub keeps the week visually aligned
+            if (i === this._hoveredDay) {
+                cairoSetColor(cr, 0.58, 0.78, 1.0, 1.0);
+            } else if (day.today) {
+                cairoSetColor(cr, 0.95, 0.95, 0.95, 0.95);
+            } else {
+                cairoSetColor(cr, 0.75, 0.75, 0.75, 0.65);
+            }
+            cr.rectangle(x, h - barH, barW, barH);
+            cr.fill();
+        }
+    }
+
+    _refreshHistory() {
+        if (this._destroyed)
+            return;
+        try {
+            this._days = readDayTotals();
+        } catch (e) {
+            this._days = [];
+        }
+        for (let i = 0; i < HISTORY_DAYS; i++) {
+            const day = this._days[i];
+            if (day && this._weekdayLabels && this._weekdayLabels[i]) {
+                this._weekdayLabels[i].text = day.weekday;
+                this._weekdayLabels[i].style =
+                    'font-size: 9pt; padding: 1px 0; ' +
+                    (day.today ? 'font-weight: bold;' : 'color: rgba(200, 200, 200, 0.75);');
+            }
+        }
+        this._hoveredDay = -1;
+        this._updateHistoryCaption();
+        if (this._chart)
+            this._chart.queue_repaint();
+        if (this._historyTimeout)
+            GLib.source_remove(this._historyTimeout);
+        this._historyTimeout = GLib.timeout_add_seconds(
+            GLib.PRIORITY_DEFAULT, HISTORY_REFRESH_SECONDS, () => {
+                this._historyTimeout = 0;
+                this._refreshHistory();
+                return GLib.SOURCE_REMOVE;
+            });
+    }
+
+    _updateHistoryCaption() {
+        const hovered = this._hoveredDay >= 0 ? this._days[this._hoveredDay] : null;
+        if (hovered) {
+            const km = (hovered.meters / 1000).toFixed(2);
+            this._caption.text =
+                `${hovered.date}: ${hovered.steps.toLocaleString()} steps · ${km} km`;
+        } else {
+            const total = this._days.reduce((sum, d) => sum + (d.steps || 0), 0);
+            this._caption.text = total > 0
+                ? `steps · last ${HISTORY_DAYS} days: ${total.toLocaleString()}`
+                : 'no history yet';
+        }
+    }
+
     _onState(state) {
         this._state = state;
         const running = this._running();
+        // A running->stopped transition finalized a session: the history
+        // gained a record, so the histogram is stale.
+        if (!running && this._wasRunning)
+            this._refreshHistory();
+        this._wasRunning = running;
 
         // Bounds arrive once the daemon has read them off the pad.
         if (state.min_speed !== null)
@@ -325,8 +570,11 @@ class WalkingPadIndicator extends QuickSettings.SystemIndicator {
             GLib.source_remove(this._commitTimeout);
         if (this._reconnectTimeout)
             GLib.source_remove(this._reconnectTimeout);
+        if (this._historyTimeout)
+            GLib.source_remove(this._historyTimeout);
         this._toggle.destroy();
         this._slider.destroy();
+        this._historyBox.destroy();
         super.destroy();
     }
 });

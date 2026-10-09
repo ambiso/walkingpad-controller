@@ -47,6 +47,13 @@ let
   # baked to the same value, so the two can never drift apart; the daemon
   # chmods the socket 0o666 so every local user may steer the belt.
   socketPath = "/run/walkingpad/daemon.sock";
+
+  # Session history: one JSON line per finalized pad session. StateDirectory
+  # makes it survive service restarts and reboots (unlike the socket, which
+  # lives in the tmpfs RuntimeDirectory); the file is created 0644 (UMask
+  # below) and the directory is traversable, so any user's
+  # `walkingpad-client history` can read the totals.
+  historyPath = "/var/lib/walkingpad/history.jsonl";
 in
 {
   options.services.walkingpad = {
@@ -99,6 +106,7 @@ in
           [
             "${daemon}/bin/walkingpad-daemon"
             "--socket ${socketPath}"
+            "--history ${historyPath}"
             "--keepalive ${toString cfg.keepalive}"
           ]
           ++ lib.optionals (cfg.deviceAddress != null) [
@@ -120,6 +128,12 @@ in
         # reach the 0o666 socket inside it.
         RuntimeDirectory = "walkingpad";
         RuntimeDirectoryMode = "0755";
+
+        # Persistent home for the session history (ProtectSystem=strict
+        # leaves /var read-only without this); traversable so every user
+        # can read the 0644 records for `walkingpad-client history`.
+        StateDirectory = "walkingpad";
+        StateDirectoryMode = "0755";
 
         # AF_UNIX only: the D-Bus system bus and the control socket are
         # the daemon's entire network surface; deny the rest, including IP.
