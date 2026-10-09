@@ -453,7 +453,7 @@ class WalkingPadIndicator extends QuickSettings.SystemIndicator {
             const hovered = idx >= 0 && idx < HISTORY_DAYS ? idx : -1;
             if (hovered !== this._hoveredDay) {
                 this._hoveredDay = hovered;
-                this._updateHistoryCaption();
+                this._updateCaption(this._state, this._running());
                 actor.queue_repaint();
             }
             return true;
@@ -461,7 +461,7 @@ class WalkingPadIndicator extends QuickSettings.SystemIndicator {
         this._chart.connect('leave-event', () => {
             if (this._hoveredDay !== -1) {
                 this._hoveredDay = -1;
-                this._updateHistoryCaption();
+                this._updateCaption(this._state, this._running());
                 this._chart.queue_repaint();
             }
             return true;
@@ -559,20 +559,24 @@ class WalkingPadIndicator extends QuickSettings.SystemIndicator {
             }
         }
         this._hoveredDay = -1;
-        this._updateHistoryCaption();
+        this._updateCaption(this._state, this._running());
         if (this._chart)
             this._chart.queue_repaint();
     }
 
-    _updateHistoryCaption() {
+    _updateCaption(state, running) {
+        // Full-width caption, so long values fit: hovered day > live
+        // session details > today's totals.
         const hovered = this._hoveredDay >= 0 ? this._days[this._hoveredDay] : null;
         if (hovered) {
             const km = (hovered.meters / 1000).toFixed(2);
             this._caption.text =
                 `${hovered.date}: ${hovered.steps.toLocaleString()} steps · ${km} km`;
+        } else if (running && state) {
+            const km = (state.distance / 1000).toFixed(2);
+            this._caption.text =
+                `${this._formatDuration(state.elapsed)} · ${state.steps.toLocaleString()} steps · ${km} km`;
         } else {
-            // Default: today's totals, so the distance has a persistent
-            // place (the toggle subtitle is too tight for it).
             const today = this._days[this._days.length - 1];
             if (today && (today.steps > 0 || today.meters > 0)) {
                 const km = (today.meters / 1000).toFixed(2);
@@ -611,27 +615,26 @@ class WalkingPadIndicator extends QuickSettings.SystemIndicator {
 
         this._toggle.checked = running || state.starting === true;
         this._toggle.subtitle = this._subtitle(state, running);
+        // The slider's native icon label carries the speed (like the
+        // volume slider's percentage).
+        this._sliderItem.iconLabel = running
+            ? `${this._displaySpeed(state).toFixed(1)} km/h` : '';
+        this._updateCaption(state, running);
         this._icon.opacity = running ? 255 : (state.connected ? 160 : 80);
     }
 
     _subtitle(state, running) {
+        // State words only: the Quick Settings column ellipsizes around 30
+        // characters, which no stats string survives. The numbers live on
+        // the slider's icon label (speed) and the full-width histogram
+        // caption (duration, steps, distance).
         if (this._countdown > 0)
             return `starting in ${this._countdown}…`;
         if (state.starting)
-            // The pad counts down ~3 s after an accepted start command
-            // before the belt moves; without this the toggle looks dead.
             return 'starting…';
         if (!state.connected)
             return 'pad not connected';
-        // Keep this short: the Quick Settings column ellipsizes around 30
-        // characters, so distance stays out (it is shown by the histogram
-        // caption on hover and by `walkingpad-client history`).
-        const time = this._formatDuration(state.elapsed);
-        const steps = `${state.steps} steps`;
-        if (!running)
-            return `stopped · ${time} · ${steps}`;
-        const speed = `${this._displaySpeed(state).toFixed(1)} km/h`;
-        return `${speed} · ${time} · ${steps}`;
+        return running ? 'walking' : 'stopped';
     }
 
     // Session seconds as h:mm:ss, or m:ss under an hour. Matches how the
