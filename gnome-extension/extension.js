@@ -286,7 +286,10 @@ class WalkingPadIndicator extends QuickSettings.SystemIndicator {
         // ">>" — and the speed lives in the histogram caption.
         this._sliderItem.iconName = 'media-seek-forward-symbolic';
         this._slider = this._sliderItem.slider;
-        this._slider.connect('drag-begin', () => { this._dragging = true; });
+        this._slider.connect('drag-begin', () => {
+            this._dragging = true;
+            this._cancelSpeedCommit();
+        });
         this._slider.connect('drag-end', () => {
             this._dragging = false;
             this._commitSpeed();
@@ -384,8 +387,7 @@ class WalkingPadIndicator extends QuickSettings.SystemIndicator {
         this._speed = this._targetSpeed();
         if (this._dragging)
             return;  // one command when the drag ends, not per motion
-        if (this._commitTimeout)
-            GLib.source_remove(this._commitTimeout);
+        this._cancelSpeedCommit();
         this._commitTimeout = GLib.timeout_add(GLib.PRIORITY_DEFAULT, SPEED_COMMIT_MS, () => {
             this._commitTimeout = 0;
             this._commitSpeed();
@@ -393,7 +395,17 @@ class WalkingPadIndicator extends QuickSettings.SystemIndicator {
         });
     }
 
+    _cancelSpeedCommit() {
+        if (this._commitTimeout) {
+            GLib.source_remove(this._commitTimeout);
+            this._commitTimeout = 0;
+        }
+    }
+
     _commitSpeed() {
+        // Any queued (debounced) commit is superseded: the last user
+        // action wins, never a stale intermediate value.
+        this._cancelSpeedCommit();
         this._speed = this._targetSpeed();
         // Hold the committed speed optimistically until the pad reports
         // it (or the commit is presumed lost); snapping back to the
