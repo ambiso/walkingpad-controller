@@ -38,8 +38,10 @@ let
 
   # This flake's own packages; no host overlay involved. stdenv is used
   # for the system name because pkgs.system is deprecated in nixpkgs.
-  daemon = self.packages.${pkgs.stdenv.hostPlatform.system}.walkingpad-daemon;
-  client = self.packages.${pkgs.stdenv.hostPlatform.system}.walkingpad-client;
+  system = pkgs.stdenv.hostPlatform.system;
+  daemon = self.packages.${system}.walkingpad-daemon;
+  client = self.packages.${system}.walkingpad-client;
+  gnomeExtension = self.packages.${system}.walkingpad-gnome-extension;
 
   # Fixed control-socket path. walkingpad-client's DEFAULT_SOCKET is
   # baked to the same value, so the two can never drift apart; the daemon
@@ -60,6 +62,18 @@ in
       type = lib.types.number;
       default = 30;
       description = "Seconds between silent link checks (vendor property reads) that keep the BLE connection from idling out. 0 disables them.";
+    };
+
+    gnomeExtension = lib.mkOption {
+      type = lib.types.bool;
+      default = false;
+      description = ''
+        Install the GNOME Shell Quick Settings extension (WalkingPad
+        start/stop toggle and speed slider) for every user. Installing is
+        not enabling: each user turns it on once with
+        `gnome-extensions enable walkingpad@ambiso` (and Wayland needs a
+        re-login before the shell picks a newly installed extension up).
+      '';
     };
   };
 
@@ -140,7 +154,10 @@ in
     };
 
     # The client on PATH for every user: pure standard library, and its
-    # only interface is the daemon socket above.
-    environment.systemPackages = [ client ];
+    # only interface is the daemon socket above. The GNOME Shell
+    # extension rides along when asked for; it reads the same socket.
+    environment.systemPackages =
+      [ client ]
+      ++ lib.optionals cfg.gnomeExtension [ gnomeExtension ];
   };
 }

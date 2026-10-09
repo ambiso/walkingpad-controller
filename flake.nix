@@ -138,6 +138,30 @@
             flakeIgnore = [ "E501" ];
           } (builtins.readFile ./nix/wp_client.py);
 
+          # GNOME Shell extension: a Quick Settings toggle + speed slider
+          # fed by the daemon's watch stream. No build step; the extension
+          # is plain ESM JavaScript plus a metadata file and a symbolic
+          # icon. Installed under its uuid so `gnome-extensions enable
+          # walkingpad@ambiso` finds it once it is on XDG_DATA_DIRS via
+          # environment.systemPackages (the NixOS module wires this up
+          # behind services.walkingpad.gnomeExtension).
+          walkingpad-gnome-extension = pkgs.stdenv.mkDerivation {
+            pname = "walkingpad-gnome-shell-extension";
+            version = "0.1.0";
+            src = ./gnome-extension;
+            installPhase = ''
+              runHook preInstall
+              mkdir -p "$out/share/gnome-shell/extensions/walkingpad@ambiso"
+              cp -r "$src"/. "$out/share/gnome-shell/extensions/walkingpad@ambiso/"
+              runHook postInstall
+            '';
+            passthru.extensionUuid = "walkingpad@ambiso";
+            meta = {
+              description = "GNOME Shell Quick Settings extension for the WalkingPad daemon";
+              license = pkgs.lib.licenses.mit;
+            };
+          };
+
           # bubblewrap launcher: filesystem/process/network isolation while
           # exposing exactly one host resource — the system bus socket, which
           # is the only interface the CLI needs. "$@" forwards subcommands and
@@ -159,6 +183,7 @@
           walkingpad-cli = walkingpad-cli;
           walkingpad-daemon = walkingpad-daemon;
           walkingpad-client = walkingpad-client;
+          walkingpad-gnome-extension = walkingpad-gnome-extension;
           walkingpad-sandboxed = walkingpad-sandboxed;
           default = walkingpad-sandboxed;
         });
