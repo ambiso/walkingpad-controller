@@ -26,10 +26,7 @@ buildPythonPackage rec {
   # The exact wheel URL from PyPI's file index (files.pythonhosted.org).
   src = fetchurl {
     url = "https://files.pythonhosted.org/packages/d5/77/621d35172e7e620ae38e22db5ac9d023c77981176f27ca437ec55ffd88c6/walkingpad_controller-0.5.1-py3-none-any.whl";
-    # Placeholder — on the first build Nix prints the correct SRI hash; paste
-    # it here and rebuild. Alternative:
-    #   nix hash to-sri --type sha256 "$(nix-prefetch-url <wheel-url>)"
-    hash = lib.fakeHash;
+    hash = "sha256-VSnEx+YmEkYXMoBZjynORpn8LMI4vXJhvJyIvTR9s8c=";
   };
 
   # Runtime dependencies from the wheel's requires_dist metadata:

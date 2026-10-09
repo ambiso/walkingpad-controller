@@ -43,7 +43,7 @@
       walkingpadOverlay = final: prev: {
         pythonPackagesExtensions = prev.pythonPackagesExtensions ++ [
           (py-final: py-prev: {
-            walkingpad-controller = py-final.callPackage ./walkingpad-controller.nix { };
+            walkingpad-controller = py-final.callPackage ./nix/walkingpad-controller.nix { };
           })
         ];
       };
