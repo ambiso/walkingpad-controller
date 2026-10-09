@@ -112,6 +112,14 @@ async def find_device(address=None, prefix="KS-", timeout=10.0):
     return await BleakScanner.find_device_by_filter(match, timeout=timeout)
 
 
+def _dbus_value(variant, default=None):
+    # dbus-fast returns properties from GetManagedObjects as Variant
+    # wrappers; comparing a Variant against a plain value never matches.
+    if variant is None:
+        return default
+    return getattr(variant, "value", variant)
+
+
 async def bluez_force_disconnect(address):
     # The pad does not advertise while a GATT connection exists, and
     # bleak cannot connect to a bare address that is not advertising, so
@@ -134,9 +142,11 @@ async def bluez_force_disconnect(address):
         objects = reply.body[0] if reply.body else {}
         for path, interfaces in objects.items():
             props = (interfaces or {}).get("org.bluez.Device1")
-            if not props or props.get("Address") != address:
+            if not props:
                 continue
-            if not props.get("Connected"):
+            if _dbus_value(props.get("Address")) != address:
+                continue
+            if not _dbus_value(props.get("Connected"), False):
                 continue
             await bus.call(Message(
                 destination="org.bluez", path=path,
