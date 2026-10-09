@@ -181,10 +181,12 @@ class DaemonLink {
     _readWatchLine() {
         if (!this._watchIn || this._stopped)
             return;
-        this._watchIn.read_line_utf8_async(GLib.PRIORITY_DEFAULT, null, (in_, res) => {
+        // GJS removed the read_line_utf8_* overrides; read_line_async
+        // yields bytes, decoded here.
+        this._watchIn.read_line_async(GLib.PRIORITY_DEFAULT, null, (in_, res) => {
             let line = null;
             try {
-                [line] = in_.read_line_utf8_finish(res);
+                [line] = in_.read_line_finish(res);
             } catch (e) {
                 this._closeWatch();
                 this._onDown();
@@ -196,7 +198,7 @@ class DaemonLink {
                 return;
             }
             try {
-                const msg = JSON.parse(line);
+                const msg = JSON.parse(decoder.decode(line));
                 if (msg && msg.ok && msg.state)
                     this._onState(msg.state);
             } catch (e) {
@@ -229,11 +231,11 @@ class DaemonLink {
             const din = new Gio.DataInputStream({
                 base_stream: conn.get_input_stream(),
             });
-            din.read_line_utf8_async(GLib.PRIORITY_DEFAULT, null, (in_, res) => {
+            din.read_line_async(GLib.PRIORITY_DEFAULT, null, (in_, res) => {
                 try {
-                    const [line] = in_.read_line_utf8_finish(res);
+                    const [line] = in_.read_line_finish(res);
                     if (line !== null) {
-                        const msg = JSON.parse(line);
+                        const msg = JSON.parse(decoder.decode(line));
                         if (msg && msg.state)
                             this._onState(msg.state);
                     }
