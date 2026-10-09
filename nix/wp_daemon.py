@@ -112,6 +112,9 @@ async def find_device(address=None, prefix="KS-", timeout=10.0):
     return await BleakScanner.find_device_by_filter(match, timeout=timeout)
 
 
+GAP_NAME = "00002a00-0000-1000-8000-00805f9b34fb"  # Device Name (GAP)
+
+
 class Pad:
     """One persistent BLE link: unlock, control, telemetry, reconnect."""
 
@@ -599,11 +602,34 @@ class Pad:
 
     async def connect_once(self):
         device = await find_device(self.address, self.prefix)
-        if device is None:
+        client = None
+        if device is not None:
+            name = device.name
+            client = BleakClient(device)
+            await client.connect()
+        elif self.address:
+            # The pad does not advertise while a GATT connection exists —
+            # including a stale one that bluetoothd never tore down after a
+            # link failure, which blocks discovery forever (the reconnect
+            # loop then deadlocks against its own leftover connection). A
+            # direct connect resolves both cases: it hands us the live pad
+            # or the stale connection, which this daemon then owns and can
+            # disconnect properly on the next failure.
+            print("walkingpad: scan found nothing; trying direct connect "
+                  "to %s" % self.address, file=sys.stderr)
+            client = BleakClient(self.address)
+            await client.connect()
+            try:
+                name = bytes(await client.read_gatt_char(GAP_NAME)).decode(
+                    errors="replace").strip("\x00 ")
+            except Exception:
+                # The vendor unlock token needs the last four chars of the
+                # advertised name; reuse the one learned from a previous
+                # connection, if any.
+                name = (self.state.get("device") or {}).get("name") or "KS-"
+        else:
             raise RuntimeError("no WalkingPad found (is it powered on?)")
-        self._set(device={"address": device.address, "name": device.name})
-        client = BleakClient(device)
-        await client.connect()
+        self._set(device={"address": client.address, "name": name})
         self.client = client
         self._set(connected=True)
         print("walkingpad: connected to %s (%s)" % (device.name, device.address),
@@ -658,8 +684,14 @@ class Pad:
                 if self.client is not None:
                     try:
                         await self.client.disconnect()
-                    except Exception:
-                        pass
+                    except Exception as exc:
+                        # bluetoothd can refuse (or the link may already be
+                        # half-dead), leaving a stale connection that
+                        # blocks discovery; the direct-connect fallback in
+                        # connect_once recovers from that on the next
+                        # attempt. Log it so the situation is visible.
+                        print("walkingpad: disconnect after failure "
+                              "errored: %s" % exc, file=sys.stderr)
                     self.client = None
                 self._set(connected=False, unlocked=False, control=False,
                           belt="unknown")
