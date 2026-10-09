@@ -36,9 +36,10 @@ self:
 let
   cfg = config.services.walkingpad;
 
-  # This flake's own packages; no host overlay involved.
-  daemon = self.packages.${pkgs.system}.walkingpad-daemon;
-  client = self.packages.${pkgs.system}.walkingpad-client;
+  # This flake's own packages; no host overlay involved. stdenv is used
+  # for the system name because pkgs.system is deprecated in nixpkgs.
+  daemon = self.packages.${pkgs.stdenv.hostPlatform.system}.walkingpad-daemon;
+  client = self.packages.${pkgs.stdenv.hostPlatform.system}.walkingpad-client;
 
   # Fixed control-socket path. walkingpad-client's DEFAULT_SOCKET is
   # baked to the same value, so the two can never drift apart; the daemon
@@ -56,7 +57,7 @@ in
     };
 
     keepalive = lib.mkOption {
-      type = lib.types.floats.nonnegative;
+      type = lib.types.number;
       default = 30;
       description = "Seconds between silent link checks (vendor property reads) that keep the BLE connection from idling out. 0 disables them.";
     };
