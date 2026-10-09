@@ -272,7 +272,7 @@ class WalkingPadIndicator extends QuickSettings.SystemIndicator {
         });
         this.add_child(this._icon);
 
-        this._toggle = new QuickSettings.QuickSettingsToggle({
+        this._toggle = new QuickSettings.QuickToggle({
             title: 'WalkingPad',
             subtitle: 'connecting…',
         });
@@ -280,15 +280,22 @@ class WalkingPadIndicator extends QuickSettings.SystemIndicator {
         this._toggle.connect('clicked', () => this._onToggleClicked());
         this.quickSettingsItems.push(this._toggle);
 
-        this._adjustment = new St.Adjustment({
-            lower: 1.0,
-            upper: 6.0,
-            step_increment: 0.1,
-            value: 3.0,
+        // GNOME 50's QuickSlider wraps a normalized (0..1) Slider exposed
+        // as .slider; speed is mapped into that range from the pad's
+        // reported bounds. Commits happen on drag-end (plus a debounce
+        // for scroll/keyboard changes).
+        this._lo = 1.0;
+        this._hi = 6.0;
+        this._dragging = false;
+        this._sliderItem = new QuickSettings.QuickSlider();
+        this._slider = this._sliderItem.slider;
+        this._slider.connect('drag-begin', () => { this._dragging = true; });
+        this._slider.connect('drag-end', () => {
+            this._dragging = false;
+            this._commitSpeed();
         });
-        this._adjustment.connect('notify::value', () => this._onSliderValue());
-        this._slider = new QuickSettings.QuickSettingsSlider(this._adjustment);
-        this.quickSettingsItems.push(this._slider);
+        this._slider.connect('notify::value', () => this._onSliderValue());
+        this.quickSettingsItems.push(this._sliderItem);
 
         this._days = [];
         this._hoveredDay = -1;
@@ -316,22 +323,37 @@ class WalkingPadIndicator extends QuickSettings.SystemIndicator {
     }
 
     _targetSpeed() {
-        // Slider values arrive as float noise; the pad takes 0.1 steps.
-        return Math.round(this._adjustment.value * 10) / 10;
+        // Map the normalized slider position into the pad's speed range;
+        // the pad takes 0.1 steps, so float noise is rounded away.
+        const raw = this._lo + this._slider.value * (this._hi - this._lo);
+        return Math.round(raw * 10) / 10;
+    }
+
+    _setSliderSpeed(speed) {
+        this._syncing = true;
+        this._slider.value = (speed - this._lo) / (this._hi - this._lo);
+        this._syncing = false;
     }
 
     _onSliderValue() {
         if (this._syncing)
             return;
         this._speed = this._targetSpeed();
+        if (this._dragging)
+            return;  // one command when the drag ends, not per motion
         if (this._commitTimeout)
             GLib.source_remove(this._commitTimeout);
         this._commitTimeout = GLib.timeout_add(GLib.PRIORITY_DEFAULT, SPEED_COMMIT_MS, () => {
             this._commitTimeout = 0;
-            // "speed" starts the belt if it is stopped, matching the CLI.
-            this._link.command({cmd: 'speed', speed: this._speed});
+            this._commitSpeed();
             return GLib.SOURCE_REMOVE;
         });
+    }
+
+    _commitSpeed() {
+        this._speed = this._targetSpeed();
+        // "speed" starts the belt if it is stopped, matching the CLI.
+        this._link.command({cmd: 'speed', speed: this._speed});
     }
 
     _running() {
@@ -500,26 +522,19 @@ class WalkingPadIndicator extends QuickSettings.SystemIndicator {
         this._wasRunning = running;
 
         // Bounds arrive once the daemon has read them off the pad.
-        if (state.min_speed !== null)
-            this._setBound('lower', state.min_speed);
-        if (state.max_speed !== null)
-            this._setBound('upper', state.max_speed);
+        if (state.min_speed !== null && state.min_speed > 0)
+            this._lo = state.min_speed;
+        if (state.max_speed !== null && state.max_speed > this._lo)
+            this._hi = state.max_speed;
 
         // Reflect the pad in the slider unless the user is dragging it.
-        if (running && Math.abs(this._adjustment.value - state.speed) > 0.05) {
-            this._syncing = true;
-            this._adjustment.value = state.speed;
-            this._syncing = false;
-        }
+        if (running && !this._dragging &&
+            Math.abs(this._targetSpeed() - state.speed) > 0.05)
+            this._setSliderSpeed(state.speed);
 
         this._toggle.checked = running;
         this._toggle.subtitle = this._subtitle(state, running);
         this._icon.opacity = running ? 255 : (state.connected ? 160 : 80);
-    }
-
-    _setBound(prop, value) {
-        if (Math.abs(this._adjustment[prop] - value) > 1e-9)
-            this._adjustment[prop] = value;
     }
 
     _subtitle(state, running) {
@@ -573,7 +588,7 @@ class WalkingPadIndicator extends QuickSettings.SystemIndicator {
         if (this._historyTimeout)
             GLib.source_remove(this._historyTimeout);
         this._toggle.destroy();
-        this._slider.destroy();
+        this._sliderItem.destroy();
         this._historyBox.destroy();
         super.destroy();
     }
