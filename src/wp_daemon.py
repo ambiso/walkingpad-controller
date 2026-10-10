@@ -18,7 +18,7 @@ the belt keeps running. This daemon speaks the wire protocol itself:
   4. telemetry 0x2ACD (flags u16 LE; bit0 clear = speed u16 km/h*100,
      bit2 = distance u24 m, bit10 = elapsed u16 s, bit13 = steps u16,
      a KingSmith extension); machine status 0x2ADA (04 started, 02 user
-     stop, 01 safety stop, 05 speed changed, FF control lost)
+     stop/pause (parameter 01/02), 01 reset, 03 safety stop, FF control lost)
 
 Vendor frames: [cmd0, cmd1, len, data..., checksum], checksum =
 sum(all prior bytes) & 0xFF, written WITHOUT response, >=400 ms apart.
@@ -51,14 +51,6 @@ OP_SET_SPEED = 0x02
 OP_START = 0x07
 OP_STOP_PAUSE = 0x08
 
-MACHINE_STATUS = {
-    0x01: "safety-stop",
-    0x02: "stopped",
-    0x04: "started",
-    0x05: "speed-changed",
-    0xFF: "control-lost",
-}
-
 RESULT_TEXT = {
     1: "success",
     2: "op not supported",
@@ -67,7 +59,7 @@ RESULT_TEXT = {
     5: "control not permitted",
 }
 
-WRITE_PACE = 0.4  # both channels silently drop writes closer than 400 ms
+WRITE_PACE = 0.4  # documented spacing within each command channel
 
 
 class ReconnectRequested(Exception):
@@ -80,25 +72,197 @@ def _queue_start(pad, request):
     # it, flag the state stream so clients show "starting…" through the
     # reconnect window, and wake the reconnect loop immediately.
     pad.pending_start = {"speed": request.get("speed")}
-    pad._set(starting=True)
+    pad.mark_starting()
     pad.reconnect_now.set()
-    asyncio.get_running_loop().create_task(pad._starting_watchdog())
 
 
 FLUSH_INTERVAL = 5.0  # min seconds between current.json rewrites
 
-# Session stats are accumulated as deltas between consecutive telemetry
-# frames (~1 s apart while the belt runs), in the pad's own counter
-# widths. A decrease modulo the counter width is either a counter wrap
-# (tiny true delta) or a session finalize (delta near the full counter
-# range); these thresholds — far beyond anything walkable between two
-# frames — separate them once, for every counter.
+# Assume continuation unless a modulo delta exceeds these thresholds.
+# This suits short reconnects/reboots, but cannot identify every missed
+# session boundary. See README.md for the deliberate tradeoffs.
 PAD_TO_RECORD = {
     "distance": ("distance", 0xFFFFFF),  # u24 meters
     "elapsed": ("duration", 0xFFFF),      # u16 seconds of walking
     "steps": ("steps", 0xFFFF),           # u16 steps
 }
 RESET_THRESHOLD = {"distance": 50000, "duration": 3600, "steps": 50000}
+
+
+def parse_telemetry(data):
+    """Decode a complete notification; discard truncated frames atomically."""
+    # Fields in flag-bit order. None means consume without exposing it.
+    fields = (
+        (2, "speed"),     # bit 0 clear: instantaneous speed (km/h * 100)
+        (2, None),        # average speed
+        (3, "distance"),  # metres
+        (4, None),        # inclination + ramp angle
+        (4, None),        # positive + negative elevation gain
+        (1, None),        # instantaneous pace
+        (1, None),        # average pace
+        (5, None),        # total energy + energy/hour + energy/minute
+        (1, None),        # heart rate
+        (1, None),        # metabolic equivalent
+        (2, "elapsed"),   # seconds
+        (2, None),        # remaining time
+        (4, None),        # force on belt + power output (s16 x2)
+        (2, "steps"),     # KingSmith extension (u16)
+    )
+    if len(data) < 2:
+        return {}
+    flags = int.from_bytes(data[:2], "little")
+    offset = 2
+    values = {}
+    for bit, (size, name) in enumerate(fields):
+        present = flags & (1 << bit)
+        if bit == 0:
+            present = not present
+        if not present:
+            continue
+        end = offset + size
+        if end > len(data):
+            return {}
+        if name is not None:
+            values[name] = int.from_bytes(data[offset:end], "little")
+        offset = end
+    if "speed" in values:
+        values["speed"] /= 100.0
+    return values
+
+
+class Sessions:
+    """Session deltas and optional persistence; raw counters stay internal."""
+
+    def __init__(self, path):
+        self.path = path
+        self.directory = os.path.dirname(path) or "."
+        self.current_path = os.path.join(self.directory, "current.json")
+        self.failed = False
+        self.last_flush = 0.0
+        self.session = None
+        self.previous = {}
+        self.stopped = False
+        self.revision = 0
+        if path:
+            try:
+                with open(self.current_path, encoding="utf-8") as fh:
+                    snapshot = json.load(fh)
+                session, previous = snapshot["session"], snapshot["prev"]
+                if not isinstance(session, dict) or not isinstance(previous, dict):
+                    return
+                if any(type(session.get(field)) is not int or session[field] < 0
+                       for field in RESET_THRESHOLD):
+                    return
+                if any(type(value) is not int or not 0 <= value <= PAD_TO_RECORD[field][1]
+                       for field, value in previous.items()):
+                    return
+                self.session = {field: session[field] for field in RESET_THRESHOLD}
+                self.previous = previous
+            except (OSError, ValueError, KeyError, TypeError):
+                pass
+
+    def start(self):
+        # A start following a known stop establishes a new zero baseline.
+        # Resuming a pause or reconnecting retains the active session.
+        if self.session is None:
+            self.previous = {}
+        self.stopped = False
+
+    def update(self, counters, walking):
+        reset = any(
+            ((counters[field] - self.previous[field]) & mask) > RESET_THRESHOLD[record]
+            for field, (record, mask) in PAD_TO_RECORD.items()
+            if field in counters and field in self.previous)
+        if reset:
+            self.reset()
+        # Ignore telemetry trailing a known stop until a reset or start.
+        if self.stopped:
+            return
+        if self.session is None:
+            if not walking:
+                return
+            self.session = dict.fromkeys(RESET_THRESHOLD, 0)
+        for field, (record, mask) in PAD_TO_RECORD.items():
+            if field in counters:
+                old = self.previous.get(field, 0)
+                self.session[record] += (counters[field] - old) & mask
+                self.previous[field] = counters[field]
+        self.flush()
+
+    def reset(self):
+        self.finish()
+        self.previous = {}
+        self.stopped = False
+
+    def live(self):
+        totals = self.session or {}
+        return {field: totals.get(record, 0)
+                for field, (record, _mask) in PAD_TO_RECORD.items()}
+
+    def current(self):
+        if self.session is None:
+            return None
+        return {"ts": int(time.time()), "date": time.strftime("%Y-%m-%d"),
+                "session": dict(self.session), "prev": dict(self.previous)}
+
+    def finish(self):
+        self.stopped = True
+        session, self.session = self.session, None
+        self.last_flush = 0.0
+        if session is None:
+            return
+        if any(session.values()):
+            self.revision += 1
+        if not self.path or self.failed:
+            return
+        try:
+            if any(session.values()):
+                os.makedirs(self.directory, exist_ok=True)
+                with open(self.path, "a", encoding="utf-8") as fh:
+                    record = {"ts": int(time.time()), "date": time.strftime("%Y-%m-%d"),
+                              "reason": "stop", **session}
+                    fh.write(json.dumps(record) + "\n")
+            # Remove even a zero-session snapshot, so it cannot be recovered.
+            if os.path.exists(self.current_path):
+                os.unlink(self.current_path)
+        except OSError as exc:
+            self._disable(exc)
+
+    def read(self):
+        records = []
+        if self.path:
+            try:
+                with open(self.path, encoding="utf-8") as fh:
+                    for line in fh:
+                        try:
+                            record = json.loads(line)
+                            if isinstance(record, dict):
+                                records.append(record)
+                        except ValueError:
+                            continue
+            except OSError:
+                pass
+        return records
+
+    def flush(self):
+        if not self.path or self.failed or self.session is None:
+            return
+        now = time.monotonic()
+        if now - self.last_flush < FLUSH_INTERVAL:
+            return
+        try:
+            os.makedirs(self.directory, exist_ok=True)
+            tmp = self.current_path + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as fh:
+                fh.write(json.dumps(self.current()) + "\n")
+            os.replace(tmp, self.current_path)
+            self.last_flush = now
+        except OSError as exc:
+            self._disable(exc)
+
+    def _disable(self, exc):
+        self.failed = True
+        print("walkingpad: history disabled (%s)" % exc, file=sys.stderr)
 
 
 def ks_frame(cmd0, cmd1, data):
@@ -181,29 +345,13 @@ class Pad:
         self.prefix = args.prefix
         self.keepalive = args.keepalive
         self.reconnect_delay = args.reconnect_delay
-        self.history_path = args.history
-        self.history_dir = os.path.dirname(args.history) if args.history else ""
-        self.current_path = (os.path.join(self.history_dir, "current.json")
-                             if self.history_dir else "")
-        self.history_failed = False
-        self.pause_pending = False
-        self.last_flush = 0.0
-        # Session accounting: stats are accumulated per telemetry frame
-        # (see _on_telemetry), never taken from the counters' absolute
-        # values, so counter wraps and session finalizes need no special
-        # cases of their own.
-        self.session = None          # {distance, duration, steps} or None
-        self.prev_counters = {}      # last raw telemetry values per field
-        # A leftover current.json from an unclean shutdown (power loss,
-        # systemd stop mid-session) is the accumulated session plus the
-        # last raw counters seen. The first telemetry frame after startup
-        # resolves it with the same delta rule as everything else.
-        self.recovery = self._read_current()
+        self.sessions = Sessions(args.history)
         # Immediate-reconnect request (a start pressed while the pad is
         # in standby must not wait for the keepalive to notice the dead
         # link), and a start queued across that reconnect.
         self.reconnect_now = asyncio.Event()
         self.pending_start = None
+        self.starting_task = None
         self.client = None
         self.vendor_lock = asyncio.Lock()
         self.vendor_reply = None
@@ -218,9 +366,8 @@ class Pad:
             "starting": False,
             "belt": "unknown",
             "speed": 0.0,
-            "distance": 0,
-            "elapsed": 0,
-            "steps": 0,
+            "history_revision": self.sessions.revision,
+            **self.sessions.live(),
             "min_speed": None,
             "max_speed": None,
             "firmware": None,
@@ -228,209 +375,14 @@ class Pad:
         }
 
     def _set(self, **changes):
-        belt_before = self.state["belt"]
-        # The pad counts down ~3 s between an accepted start and the belt
-        # actually moving; any belt transition out of "unknown" ends that
-        # window, whatever notification carries it.
-        if self.state.get("starting") and changes.get("belt") is not None:
-            changes["starting"] = False
         self.state.update(changes)
-        # Entering "stopped" (machine-status frame: user stop, safety
-        # stop, daemon command) finalizes the pad session. The previous
-        # state can be "started" but also "unknown" — after a BLE
-        # reconnect the belt is only known through telemetry until the
-        # next status frame, and the stop frame must still close the
-        # session. Entering "unknown" (link lost) does not close it: the
-        # pad session most likely keeps running and the delta rule sorts
-        # it out on reconnect.
-        if (self.state["belt"] == "stopped" and belt_before != "stopped"):
-            self._on_belt_stopped()
-        if any(k in changes for k in ("distance", "elapsed", "steps")):
-            self._on_telemetry(changes)
+        self.state["history_revision"] = self.sessions.revision
         for queue in self.watchers:
             queue.put_nowait(dict(self.state))
 
-    # -- session accounting -------------------------------------------------
-    #
-    # Stats are accumulated as per-frame deltas of the pad's telemetry
-    # counters, never taken from the counters' absolute values:
-    #
-    #     delta = (new - old) & counter_mask
-    #
-    # The pad pushes telemetry about once a second while the belt runs, so
-    # consecutive frames differ by tiny amounts, which makes one modulo
-    # rule handle every special case at once:
-    #
-    #  * a u16/u24 counter wrap: the wrapped remainder minus the old value
-    #    modulo the counter width is the real per-frame increment — wraps
-    #    disappear entirely, and even a ~18 h session records as one
-    #    session with correct totals;
-    #  * a session finalize and new session between two frames (stop via
-    #    the handheld remote or the phone app racing past the
-    #    machine-status frames, or the pad's trailing all-zero frame after
-    #    a stop): (small - large) mod 2^n is near the full counter range —
-    #    anything beyond RESET_THRESHOLD (an hour of walking between two
-    #    consecutive frames cannot happen; the keepalive reconnects the
-    #    link long before) closes the accumulated session and starts a
-    #    fresh one from the incoming frame;
-    #  * a BLE gap (reconnect): the delta is the genuinely walked amount
-    #    and accumulates normally.
-    #
-    # The session is closed explicitly by the belt-stopped signal above
-    # (unless the stop was a pause, which keeps the pad session open),
-    # and {accumulated session, last raw counters} are flushed atomically
-    # to current.json every FLUSH_INTERVAL seconds, so an unclean shutdown
-    # loses at most that window. On startup the leftover snapshot resumes
-    # under the same delta rule: a small delta means the same pad session
-    # continued and the snapshot is adopted; a huge one means it was
-    # finalized while the daemon was gone, and the snapshot is recorded
-    # as a completed session.
-
-    def _on_belt_stopped(self):
-        if self.pause_pending:
-            # A pause keeps the pad session open; accumulation simply
-            # stops while the belt is idle, and the eventual stop record
-            # carries the full totals.
-            self.pause_pending = False
-            return
-        self._close_session()
-
-    def _close_session(self):
-        session = self.session
-        self.session = None
-        self.prev_counters = {}
-        if session is None:
-            return
-        if session["distance"] == 0 and session["duration"] == 0:
-            return  # belt never actually moved (start then instant stop)
-        self._append_history({
-            "ts": int(time.time()),
-            "date": time.strftime("%Y-%m-%d"),
-            "reason": "stop",
-            **session,
-        })
-        try:
-            os.unlink(self.current_path)
-        except OSError:
-            pass
-        print("walkingpad: session recorded: %d m / %d s / %d steps"
-              % (session["distance"], session["duration"], session["steps"]),
-              file=sys.stderr)
-
-    def _on_telemetry(self, changes):
-        if not self.history_path or self.history_failed:
-            return
-        speed = changes.get("speed") or 0
-        walking = speed > 0 or self.state["belt"] == "started"
-        if self.session is None:
-            if not walking:
-                return
-            if self.recovery is not None:
-                # Resume the session that was open when the daemon last
-                # died; the delta logic below decides against the
-                # recovered counters whether it actually continued.
-                snapshot = self.recovery
-                self.recovery = None
-                recovered = snapshot.get("session") or {
-                    "distance": 0, "duration": 0, "steps": 0}
-                self.session = dict(recovered)
-                self.prev_counters = dict(snapshot.get("prev") or {})
-            else:
-                self.session = {"distance": 0, "duration": 0, "steps": 0}
-                self.prev_counters = {}
-        # One reset gate for the whole frame: any counter jumping by more
-        # than RESET_THRESHOLD means the pad finalized the old session
-        # (its counters reset) and is already reporting a new one.
-        for pad_field, (rec_field, mask) in PAD_TO_RECORD.items():
-            if pad_field in changes and pad_field in self.prev_counters:
-                old = self.prev_counters[pad_field]
-                delta = (changes[pad_field] - old) & mask
-                if delta > RESET_THRESHOLD[rec_field]:
-                    self._close_session()
-                    self.session = {"distance": 0, "duration": 0, "steps": 0}
-                    self.prev_counters = {}
-                    break
-        for pad_field, (rec_field, mask) in PAD_TO_RECORD.items():
-            if pad_field not in changes:
-                continue
-            old = self.prev_counters.get(pad_field)
-            if old is None:
-                self.prev_counters[pad_field] = changes[pad_field]
-                continue
-            self.session[rec_field] += ((changes[pad_field] - old) & mask)
-            self.prev_counters[pad_field] = changes[pad_field]
-        self._maybe_flush_current()
-
-    def read_history(self):
-        # Served over the control socket (see dispatch): the state
-        # directory belongs to the service's dynamic user and is not
-        # reliably readable by other users.
-        records = []
-        try:
-            with open(self.history_path, encoding="utf-8") as fh:
-                for line in fh:
-                    line = line.strip()
-                    if not line:
-                        continue
-                    try:
-                        records.append(json.loads(line))
-                    except ValueError:
-                        continue
-        except OSError:
-            pass
-        return records
-
-    def _append_history(self, record):
-        try:
-            os.makedirs(self.history_dir, exist_ok=True)
-            with open(self.history_path, "a", encoding="utf-8") as fh:
-                fh.write(json.dumps(record) + "\n")
-        except OSError as exc:
-            self._disable_history(exc)
-
-    def _disable_history(self, exc):
-        # Unwritable history (e.g. running the daemon unprivileged with the
-        # default path) must never take the pad link down.
-        self.history_failed = True
-        print("walkingpad: history disabled (%s)" % exc, file=sys.stderr)
-
-    def _read_current(self):
-        if not self.current_path or not os.path.exists(self.current_path):
-            return None
-        try:
-            with open(self.current_path, encoding="utf-8") as fh:
-                return json.load(fh)
-        except (OSError, ValueError):
-            return None
-
-    def _write_current(self, record):
-        # Atomic replace: a power cut mid-write must not corrupt the
-        # snapshot that recovery depends on.
-        tmp = self.current_path + ".tmp"
-        try:
-            with open(tmp, "w", encoding="utf-8") as fh:
-                fh.write(json.dumps(record) + "\n")
-            os.replace(tmp, self.current_path)
-        except OSError as exc:
-            self._disable_history(exc)
-
-    def _maybe_flush_current(self):
-        if self.session is None or not self.current_path or self.history_failed:
-            return
-        now = time.monotonic()
-        if now - self.last_flush < FLUSH_INTERVAL:
-            return
-        self.last_flush = now
-        self._write_current({
-            "ts": int(time.time()),
-            "date": time.strftime("%Y-%m-%d"),
-            "session": dict(self.session),
-            "prev": dict(self.prev_counters),
-        })
-
     async def _paced(self):
-        # Enforce the 400 ms spacing that both the vendor channel and the
-        # control point require; faster writes are dropped by the pad.
+        # Each channel serializes its exchanges; cross-channel spacing is
+        # not known to be required by the firmware.
         wait = self.last_write + WRITE_PACE - time.monotonic()
         if wait > 0:
             await asyncio.sleep(wait)
@@ -464,74 +416,34 @@ class Pad:
         frame = bytes(data)
         if not frame:
             return
-        status = MACHINE_STATUS.get(frame[0])
-        if status == "started":
-            self.pause_pending = False
-            self._set(belt="started")
-        elif status in ("stopped", "safety-stop"):
-            self._set(belt="stopped", speed=0.0)
-        elif status == "control-lost":
+        op = frame[0]
+        if op == 0x04:
+            self.sessions.start()
+            self._set(belt="started", starting=False)
+        elif op in (0x01, 0x03) or frame[:2] == b"\x02\x01":
+            if op == 0x01:
+                self.sessions.reset()
+            else:
+                self.sessions.finish()
+            self._set(belt="stopped", speed=0.0, starting=False,
+                      **self.sessions.live())
+        elif frame[:2] == b"\x02\x02":
+            self._set(belt="paused", speed=0.0, starting=False)
+        elif op == 0x02:
+            # A missing/unknown parameter cannot distinguish stop from pause.
+            # Preserve accounting until telemetry demonstrates a reset.
+            self._set(belt="stopped", speed=0.0, starting=False)
+        elif op == 0xFF:
             self._set(control=False)
 
     def on_data(self, _char, data):
-        # FTMS treadmill data: u16 LE flags, then fields in ascending flag-bit
-        # order. The pad sends flags 0x2404 + speed; unknown-but-set bits are
-        # consumed per the spec layout so later fields stay aligned.
-        frame = bytes(data)
-        if len(frame) < 2:
-            return
-        flags = int.from_bytes(frame[0:2], "little")
-        offset = 2
-
-        def take(size):
-            nonlocal offset
-            chunk = frame[offset:offset + size]
-            offset += size
-            return chunk if len(chunk) == size else None
-
-        speed = distance = elapsed = steps = None
-        if not flags & 0x0001:
-            chunk = take(2)  # bit 0 clear: instantaneous speed, km/h * 100
-            speed = int.from_bytes(chunk, "little") / 100.0 if chunk else None
-        if flags & 0x0002:
-            take(2)  # average speed
-        if flags & 0x0004:
-            chunk = take(3)  # total distance, meters
-            distance = int.from_bytes(chunk, "little") if chunk else None
-        if flags & 0x0008:
-            take(4)  # inclination + ramp angle (s16 x2)
-        if flags & 0x0010:
-            take(4)  # positive/negative elevation gain (u16 x2)
-        if flags & 0x0020:
-            take(1)  # pace
-        if flags & 0x0040:
-            take(1)  # average pace
-        if flags & 0x0080:
-            take(5)  # energy: u16 + u16 + u8
-        if flags & 0x0100:
-            take(1)  # heart rate
-        if flags & 0x0200:
-            take(1)  # metabolic equivalent
-        if flags & 0x0400:
-            chunk = take(2)  # elapsed time, seconds
-            elapsed = int.from_bytes(chunk, "little") if chunk else None
-        if flags & 0x0800:
-            take(2)  # remaining time
-        if flags & 0x1000:
-            take(2)  # energy per minute
-        if flags & 0x2000:
-            chunk = take(2)  # KingSmith extension: step count (u16)
-            steps = int.from_bytes(chunk, "little") if chunk else None
-        changes = {}
-        if speed is not None:
-            changes["speed"] = speed
-        if distance is not None:
-            changes["distance"] = distance
-        if elapsed is not None:
-            changes["elapsed"] = elapsed
-        if steps is not None:
-            changes["steps"] = steps
+        changes = parse_telemetry(data)
         if changes:
+            walking = changes.get("speed", self.state["speed"]) > 0
+            self.sessions.update(changes, walking)
+            if walking and self.sessions.session is not None:
+                changes.update(belt="started", starting=False)
+            changes.update(self.sessions.live())
             self._set(**changes)
 
     # -- vendor channel ---------------------------------------------------
@@ -638,17 +550,17 @@ class Pad:
     async def cmd_start(self, speed=None):
         # Start on a moving belt is refused (result 4) — if it is already
         # running, just retarget the speed.
-        self.pause_pending = False
         if self.state["belt"] == "started":
             return await self.cmd_speed(speed) if speed else 1
         result = await self.cp(OP_START)
         if result == 1:
+            self.sessions.start()
             # Accepted: the pad now counts down ~3 s before the belt moves.
             # Surface that window so clients don't look dead; the flag
             # clears on the machine-status "started" frame (or any belt
             # change) and, if that frame is missed, via the watchdog.
-            self._set(starting=True)
-            asyncio.get_running_loop().create_task(self._starting_watchdog())
+            if self.state["belt"] != "started":
+                self.mark_starting()
             if speed:
                 # The pad ramps to minimum speed first; retargeting too
                 # early is unreliable, so wait for telemetry to report
@@ -692,10 +604,16 @@ class Pad:
 
     async def _starting_watchdog(self):
         # 30 s covers a full reconnect (scan timeout 10 s + retry) plus
-        # the pad's ~3 s countdown; the flag clears on any belt change.
+        # the pad's ~3 s countdown. New starts replace this watchdog.
         await asyncio.sleep(30.0)
         if self.state.get("starting") and self.state["belt"] != "started":
             self._set(starting=False)
+
+    def mark_starting(self):
+        if self.starting_task is not None:
+            self.starting_task.cancel()
+        self._set(starting=True)
+        self.starting_task = asyncio.create_task(self._starting_watchdog())
 
     async def cmd_speed(self, speed):
         # Belt refuses speed writes while stopped; clamp to the reported
@@ -709,14 +627,19 @@ class Pad:
     async def cmd_stop(self):
         # Stop (08 01) finalizes the pad's session and resets its counters;
         # pause (08 02) keeps the session open.
-        return await self.cp(OP_STOP_PAUSE, b"\x01")
+        result = await self.cp(OP_STOP_PAUSE, b"\x01")
+        if result == 1:
+            # Also handles firmware that omits the status notification.
+            self.sessions.finish()
+            self._set(belt="stopped", speed=0.0, starting=False,
+                      **self.sessions.live())
+        return result
 
     async def cmd_pause(self):
-        # Pause keeps the pad's session open (counters keep accumulating on
-        # resume); mark it so the eventual stop record isn't mistaken for
-        # two sessions.
-        self.pause_pending = True
-        return await self.cp(OP_STOP_PAUSE, b"\x02")
+        result = await self.cp(OP_STOP_PAUSE, b"\x02")
+        if result == 1:
+            self._set(belt="paused", speed=0.0, starting=False)
+        return result
 
     async def cmd_set_buzzer(self, enabled):
         # Property 8 "switches": bit 1 = buzzer, bit 3 = interaction light.
@@ -839,8 +762,8 @@ async def dispatch(pad, request):
         # History is served over the socket: the state directory belongs
         # to the service's dynamic user and is not reliably readable by
         # other users, so clients must not parse the files directly.
-        return {"ok": True, "history": pad.read_history(),
-                "current": pad._read_current()}
+        return {"ok": True, "history": pad.sessions.read(),
+                "current": pad.sessions.current()}
     if cmd == "watch":
         return {"ok": True, "state": pad.state}
     if cmd == "reconnect":
@@ -850,10 +773,13 @@ async def dispatch(pad, request):
         pad.reconnect_now.set()
         return {"ok": True, "state": pad.state}
     if not pad.state["connected"]:
+        if cmd == "stop" and pad.pending_start is not None:
+            pad.pending_start = None
+            pad._set(starting=False)
+            return {"ok": True, "state": pad.state}
         if cmd == "start":
             # Queue the start across the reconnect; the state stream
-            # reports starting=true, so clients keep their countdown
-            # honest. The reconnect itself wakes immediately.
+            # reports starting=true throughout the reconnect window.
             _queue_start(pad, request)
             return {"ok": True, "queued": "start", "state": pad.state}
         return {"ok": False, "error": "pad not connected", "state": pad.state}

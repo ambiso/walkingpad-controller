@@ -8,7 +8,7 @@
 #   * packages.<system>.walkingpad-cli
 #                                 small CLI (scan/info/start/speed/stop) built
 #                                 from the package; source lives in
-#                                 nix/wp_cli.py, pulled in via builtins.readFile
+#                                 src/wp_cli.py, pulled in via builtins.readFile
 #   * packages.<system>.walkingpad-sandboxed
 #                                 the CLI under bubblewrap, isolated except for
 #                                 the host's D-Bus system bus socket
@@ -34,7 +34,7 @@
 #   nix run .#walkingpad-sandboxed -- stop
 #
 # Inside the dev shell, iterate on the CLI source directly (no rebuild):
-#   python nix/wp_cli.py scan
+#   python src/wp_cli.py scan
 #
 # Daemon + client (persistent link; connect/disconnect beeps happen once
 # per service start instead of once per command):
@@ -110,7 +110,7 @@
           # Remember the single-client rule: the pad serves exactly one BLE
           # connection, so no phone app may be attached when the CLI connects.
           #
-          # The script lives in nix/wp_cli.py at normal top-level
+          # The script lives in src/wp_cli.py at normal top-level
           # indentation: editors and flake8 lint it directly, and inside the
           # dev shell it runs without a rebuild. builtins.readFile splices it
           # into the derivation, where writers still flake8-checks the text
@@ -118,7 +118,7 @@
           walkingpad-cli = pkgs.writers.writePython3Bin "walkingpad" {
             libraries = [ pkgs.python3Packages.walkingpad-controller ];
             flakeIgnore = [ "E501" ];
-          } (builtins.readFile ./nix/wp_cli.py);
+          } (builtins.readFile ./src/wp_cli.py);
 
           # The daemon. It deliberately does not use the
           # walkingpad-controller library: Z1-series firmware gates all FTMS
@@ -126,17 +126,17 @@
           # supplement service, which the library never sends — its
           # REQUEST_CONTROL times out and stop/start answer result 5
           # "control not permitted" while the belt keeps running. The daemon
-          # speaks the wire protocol itself (see nix/wp_daemon.py).
+          # speaks the wire protocol itself (see src/wp_daemon.py).
           walkingpad-daemon = pkgs.writers.writePython3Bin "walkingpad-daemon" {
             libraries = [ pkgs.python3Packages.bleak ];
             flakeIgnore = [ "E501" ];
-          } (builtins.readFile ./nix/wp_daemon.py);
+          } (builtins.readFile ./src/wp_daemon.py);
 
           # The client: pure standard library, talks JSON lines to the
           # daemon's Unix socket.
           walkingpad-client = pkgs.writers.writePython3Bin "walkingpad-client" {
             flakeIgnore = [ "E501" ];
-          } (builtins.readFile ./nix/wp_client.py);
+          } (builtins.readFile ./src/wp_client.py);
 
           # Shell completions for the client, generated from its argparse
           # parser at build time (shtab) so they cannot drift from the
@@ -145,7 +145,7 @@
           walkingpad-client-completions = pkgs.stdenv.mkDerivation {
             pname = "walkingpad-client-completions";
             version = "0.1.0";
-            src = ./nix;
+            src = ./src;
             nativeBuildInputs = [
               (pkgs.python3.withPackages (ps: [ ps.shtab ]))
             ];

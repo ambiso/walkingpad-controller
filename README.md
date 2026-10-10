@@ -4,6 +4,11 @@ Nix-flaked control stack for KingSmith WalkingPad (Z1-series) treadmills:
 a persistent BLE daemon, a socket CLI, and a GNOME Shell Quick Settings
 extension.
 
+Python sources live in `src/`, Nix modules and package definitions in
+`nix/`, and the GNOME Shell extension in `gnome-extension/`. Run the
+Python regression tests with `python -m unittest discover -s tests`
+inside `nix develop`.
+
 ![Quick Settings](docs/screenshot.png)
 
 The extension as deployed on GNOME 50: the WalkingPad toggle with live
@@ -28,15 +33,40 @@ would otherwise block reconnection forever (the pad does not advertise
 while any GATT connection exists, including a dead one bluetoothd never
 tore down).
 
-**Session history** — stats are accumulated as per-frame deltas of the
-pad's telemetry counters, which makes counter wraps and session
-finalizes — including stops through the handheld remote or the phone
-app that race past the machine-status frames — fall out of one modulo
-rule. Finalized sessions are appended to
+**Session history** — distance, duration and steps are accumulated as
+per-frame counter deltas. A new session uses zero as its baseline, so
+the first frame includes activity before the daemon connected. Ordinary
+counter wraps are accumulated without wrapping the live display.
+Stop notifications finalize sessions; pause notifications preserve them.
+Finalized sessions are appended to
 `/var/lib/walkingpad/history.jsonl`; an atomic 5-second snapshot of the
-open session survives unclean shutdowns and is resolved on the next
-start. History is served over the daemon's socket (`{"cmd": "history"}`)
+open session survives unclean shutdowns and is restored at daemon startup.
+The next telemetry frame, including idle telemetry, resolves whether it
+continued. History is served over the daemon's socket (`{"cmd": "history"}`)
 because the state directory belongs to the service's dynamic user.
+
+The pad provides no session identifier in telemetry. Across a gap, we
+assume the session continued unless a modulo counter increment exceeds
+3,600 seconds, 50,000 steps or 50,000 metres. Such a jump is treated as a
+reset: record the old totals and seed a new session from the incoming
+counters if the belt is moving. This deliberately simple heuristic suits
+normal use with the computer present and short gaps such as a two-minute
+reboot; it does not reconstruct every session missed while disconnected.
+For example, 500 steps before a gap and 600 afterward are treated as 100
+additional steps, even if the pad actually stopped and began a new session.
+More than an hour of continued walking during a gap may be mistaken for
+a reset, making the recorded old totals overlap the newly seeded totals.
+Complete counter wraps before the first sample or during a long gap cannot
+be reconstructed reliably. Live totals and history use the same accounting,
+which continues even if history persistence is disabled.
+
+Status parsing follows standard FTMS: `02 01` is stop, `02 02` is pause,
+`01` is reset and `03` is safety stop. See the
+[Bluetooth SIG test suite, page 48](https://files.bluetooth.com/wp-content/uploads/dlm_uploads/2024/10/FTMS.TS_.p6.pdf).
+If firmware omits the stop/pause parameter, accounting stays open until
+counter telemetry demonstrates a reset or a daemon stop command succeeds.
+After a known stop, trailing telemetry is ignored until a start or reset
+establishes the next session.
 
 **`walkingpad-client`** — pure-stdlib CLI for the daemon socket:
 `status`, `start --speed`, `speed`, `pause`, `stop`, `set-buzzer`,
@@ -53,10 +83,11 @@ Python library, the latter wrapped in a bubblewrap sandbox that exposes
 exactly one host resource (the D-Bus system bus for BlueZ).
 
 **GNOME Shell extension** — a Quick Settings entry: the WalkingPad
-toggle (live state, `walking @ 3.0 km/h`, the pad's 3-second start
-countdown emulated client-side), a speed slider with an optimistic hold
-until the pad confirms, and a 7-day steps histogram with exact per-day
-values on hover. Talks to the daemon over the same control socket.
+toggle (live state, `walking @ 3.0 km/h`, and a local 3–2–1 start
+countdown followed by `starting…` while waiting for the belt), a speed
+slider with an optimistic hold until the pad confirms, and a 7-day steps
+histogram with exact per-day values on hover. Talks to the daemon over
+the same control socket.
 
 **`services.walkingpad`** — the NixOS module: the daemon as a systemd
 service under a dynamic user with tight sandboxing (AF_UNIX only, no

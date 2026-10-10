@@ -246,14 +246,13 @@ class WalkingPadIndicator extends QuickSettings.SystemIndicator {
         super._init();
 
         this._state = null;
-        this._speed = null;
         this._commitTimeout = 0;
         this._reconnectTimeout = 0;
         this._syncing = false;
         this._destroyed = false;
         this._pendingSpeed = null;   // slider value awaiting pad confirmation
         this._pendingSince = 0;
-        this._countdown = 0;         // client-side 3-2-1 start countdown
+        this._countdown = 0;
         this._countdownTimeout = 0;
 
         const gicon = Gio.icon_new_for_string(
@@ -320,13 +319,13 @@ class WalkingPadIndicator extends QuickSettings.SystemIndicator {
     }
 
     _onToggleClicked() {
-        const running = this._running();
-        const target = !running;
+        const target = !(this._running() || this._state?.starting || this._countdown > 0);
         this._toggle.checked = target;
         if (target) {
             this._startCountdown();
             this._link.command({cmd: 'start', speed: this._targetSpeed()});
         } else {
+            this._clearCountdown();
             this._link.command({cmd: 'stop'});
         }
     }
@@ -384,7 +383,6 @@ class WalkingPadIndicator extends QuickSettings.SystemIndicator {
     _onSliderValue() {
         if (this._syncing)
             return;
-        this._speed = this._targetSpeed();
         if (this._dragging)
             return;  // one command when the drag ends, not per motion
         this._cancelSpeedCommit();
@@ -406,14 +404,12 @@ class WalkingPadIndicator extends QuickSettings.SystemIndicator {
         // Any queued (debounced) commit is superseded: the last user
         // action wins, never a stale intermediate value.
         this._cancelSpeedCommit();
-        this._speed = this._targetSpeed();
         // Hold the committed speed optimistically until the pad reports
         // it (or the commit is presumed lost); snapping back to the
         // stale state for ~1 s reads as a rejected drag.
-        this._pendingSpeed = this._speed;
+        this._pendingSpeed = this._targetSpeed();
         this._pendingSince = GLib.get_monotonic_time();
-        // "speed" starts the belt if it is stopped, matching the CLI.
-        this._link.command({cmd: 'speed', speed: this._speed});
+        this._link.command({cmd: 'speed', speed: this._pendingSpeed});
     }
 
     _displaySpeed(state) {
@@ -613,17 +609,15 @@ class WalkingPadIndicator extends QuickSettings.SystemIndicator {
     }
 
     _onState(state) {
+        const previous = this._state;
         this._state = state;
         const running = this._running();
-        // The pad confirmed the start: the local countdown has served its
-        // purpose and the live stats take over.
         if (running)
             this._clearCountdown();
-        // A running->stopped transition finalized a session: the history
-        // gained a record, so the histogram is stale.
-        if (!running && this._wasRunning)
+        // Refresh on an actual finalization, including stop after pause or
+        // a counter reset while the belt continues running.
+        if (previous && state.history_revision !== previous.history_revision)
             this._refreshHistory();
-        this._wasRunning = running;
 
         // Bounds arrive once the daemon has read them off the pad.
         if (state.min_speed !== null && state.min_speed > 0)
@@ -637,7 +631,7 @@ class WalkingPadIndicator extends QuickSettings.SystemIndicator {
             Math.abs(this._targetSpeed() - state.speed) > 0.05)
             this._setSliderSpeed(state.speed);
 
-        this._toggle.checked = running || state.starting === true;
+        this._toggle.checked = running || state.starting === true || this._countdown > 0;
         this._toggle.subtitle = this._subtitle(state, running);
         // icon-label is the slider's accessible name — GNOME 50's
         // QuickSlider has no visible text slot; the speed shows in the
@@ -678,6 +672,7 @@ class WalkingPadIndicator extends QuickSettings.SystemIndicator {
     _onWatchDown() {
         if (this._destroyed)
             return;
+        this._clearCountdown();
         this._state = null;
         this._toggle.checked = false;
         this._toggle.subtitle = 'daemon offline';

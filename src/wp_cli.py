@@ -6,7 +6,7 @@ ignored there). writers supplies the interpreter shebang itself, so this
 file intentionally carries none — a stray `#!` past line 1 is flagged
 E265. Inside the dev shell it runs directly, no rebuild:
 
-    python nix/wp_cli.py scan
+    python src/wp_cli.py scan
 """
 
 import argparse
