@@ -9,9 +9,9 @@ Python sources live in `src/`, Nix modules and package definitions in
 Python regression tests with `python -m unittest discover -s tests`
 inside `nix develop`.
 
-![Quick Settings](docs/screenshot.png)
+[Watch the extension in action](docs/promo.mp4)
 
-The extension as deployed on GNOME 50: the WalkingPad toggle with live
+The promo shows the extension on GNOME 50: the WalkingPad toggle with live
 state and speed, the speed slider, and a seven-day steps histogram with
 per-day details on hover.
 
@@ -151,6 +151,87 @@ open session:   0.30 km  0:04:00    350 steps  (not yet counted)
 The pad serves exactly one BLE connection: while the daemon runs the
 KS Fit app cannot attach. `systemctl stop walkingpad` frees the belt
 for the app again.
+
+## Recording a promo
+
+On Linux, record the actual extension in a private headless GNOME Shell:
+
+```sh
+nix run .#walkingpad-promo -- /tmp/walkingpad-promo.mp4
+# Optional: another monitor size and the original WebM alongside the MP4
+nix run .#walkingpad-promo -- /tmp/walkingpad-promo-small.mp4 --resolution 960x600 --keep-source
+```
+
+The default uses a private 4K desktop with 4× UI scaling and produces a
+60 fps MP4, 1080 pixels high. Its width follows the menu, with balanced
+padding on opposite edges. The cursor and camera move immediately. A
+diagnostic `.log` is saved next to the video.
+Existing videos are never overwritten. Capture and encoding can take
+several minutes. The mock daemon
+provides seven days of sample history, starting with real-time telemetry
+once a second before a three-second ease-in/out brings today’s steps to
+six times the largest sample day, with 60 Hz updates during the rise.
+Session duration and distance rise
+with the steps.
+The script opens the top-right menu, zooms into the controls, sweeps all
+seven history bars in a straight line, shows the full 3–2–1 countdown,
+picks up the slider at its current handle and drags it twice, and shows the histogram growing live before
+stopping to display the updated daily total.
+It checks the resulting UI state as it goes and fails if an action stops
+working.
+
+Controls are located through the extension's actors and their current
+geometry, rather than screen coordinates. A large software cursor follows
+cubic Bézier paths with distance-based, minimum-jerk timing between
+controls, grows slightly during movement, and
+pulses briefly on clicks. The history tour uses a joined quintic Hermite spline: it flows into
+a straight sweep and out to the toggle without stopping at the joins,
+with a constant cursor size; slider drags also stay straight. Startup
+notifications are suppressed in the demo shell. The backdrop is the default
+dark wallpaper from the pinned GNOME release; the black cursor is an SVG.
+The scripting helper is injected into a temporary extension copy; no demo
+hooks are added to the installed extension. GNOME Shell, D-Bus, PipeWire,
+settings, and the mock socket use a private temporary session.
+The desktop runs at twice the output frame rate (120 Hz by default), and
+Mutter’s monitor stream is captured with rate-limit headroom. This avoids
+the dropped frames observed through GNOME’s 60 fps area-capture path.
+Capture defaults to software VP8; `--capture-codec av1-vaapi` enables
+experimental hardware AV1 on supported GPUs. It feeds CPU-converted frames
+directly from GStreamer to FFmpeg's VA-API encoder, which can use AMD's faster
+encoding presets. Both were tested on an RX 7900 XTX: hardware encoding
+reduces CPU load, but VP8 delivered more consistent frame pacing at 4K,
+so it remains the default. GPU color conversion and DMA-BUF capture were
+also tested; they introduced stalls and cursor artifacts in this setup.
+The cropped asset is encoded separately for a small file.
+The log records animation and capture frame intervals during the history tour. No WalkingPad
+or running desktop session is needed. The Nix package supplies the tools;
+it has been exercised with GNOME Shell 50.
+
+The driver is `scripts/record-promo.py`; cursor choreography and mock
+telemetry live in `scripts/promo/`. Use `--fps` to change the output frame
+rate, `--output-resolution` for encoded dimensions, and `--codec h264`
+for H.264 instead of the default AV1. A `.webm` output selects VP9 by
+default. Edit the driver's action sequence to change the tour.
+`--codec av1-vaapi` offloads final scaling and encoding to the GPU;
+the animated camera transform still runs on the CPU, limited to four threads.
+Rendering starts after capture finishes, and concurrent promo runs are rejected.
+On the same 21-second footage, software AV1 produced a 669 kB asset versus
+1,249 kB with VA-API AV1 at the configured quality settings, so software
+AV1 remains the default for the repository asset.
+
+## Tests
+
+```sh
+nix develop -c python -m unittest discover -s tests
+node --test tests/test_extension.js tests/test_promo_motion.mjs
+```
+
+The extension tests exercise the actual history-update methods with actor
+and socket stubs, including asynchronous replies, finalization, and midnight
+recovery. The motion tests verify nonzero velocity and continuous
+acceleration at the spline joins and a straight, constant-speed sweep.
+The promo tour checks real GNOME pointer interactions and confirms
+that the live histogram matches the mock's session counters before stopping.
 
 ## Credits
 

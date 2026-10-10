@@ -763,7 +763,8 @@ async def dispatch(pad, request):
         # to the service's dynamic user and is not reliably readable by
         # other users, so clients must not parse the files directly.
         return {"ok": True, "history": pad.sessions.read(),
-                "current": pad.sessions.current()}
+                "current": pad.sessions.current(),
+                "history_revision": pad.sessions.revision}
     if cmd == "watch":
         return {"ok": True, "state": pad.state}
     if cmd == "reconnect":

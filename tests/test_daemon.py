@@ -344,6 +344,11 @@ class CommandTests(unittest.IsolatedAsyncioTestCase):
         telemetry(pad, 101, 152, 81)
         reply = await daemon.dispatch(pad, {"cmd": "history"})
         self.assertEqual(reply["current"]["session"]["duration"], 101)
+        self.assertEqual(reply["history_revision"], pad.state["history_revision"])
+        pad.cp = AsyncMock(return_value=1)
+        await pad.cmd_stop()
+        finalized = await daemon.dispatch(pad, {"cmd": "history"})
+        self.assertEqual(finalized["history_revision"], reply["history_revision"] + 1)
 
 
 if __name__ == "__main__":

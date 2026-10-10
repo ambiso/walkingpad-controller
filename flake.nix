@@ -180,6 +180,37 @@
             };
           };
 
+          promoWallpaper = pkgs.runCommand "walkingpad-promo-wallpaper" {
+            nativeBuildInputs = [ pkgs.libjxl ];
+          } ''
+            mkdir -p "$out"
+            djxl ${pkgs.gnome-backgrounds}/share/backgrounds/gnome/adwaita-d.jxl "$out/wallpaper.png"
+            printf '%s' '<svg xmlns="http://www.w3.org/2000/svg" width="1920" height="1080" viewBox="0 0 1920 1080" preserveAspectRatio="xMidYMid slice"><image width="1920" height="1080" preserveAspectRatio="xMidYMid slice" href="wallpaper.png"/></svg>' > "$out/wallpaper.svg"
+          '';
+
+          promoSource = pkgs.runCommand "walkingpad-promo-source" { } ''
+            mkdir -p "$out/scripts" "$out/gnome-extension"
+            cp -r ${./scripts}/. "$out/scripts/"
+            cp -r ${./gnome-extension}/. "$out/gnome-extension/"
+          '';
+
+          walkingpad-promo = pkgs.writeShellApplication {
+            name = "walkingpad-promo";
+            runtimeInputs = [
+              pkgs.gnome-shell pkgs.glib pkgs.dbus pkgs.pipewire
+              pkgs.wireplumber pkgs.ffmpeg
+              (pkgs.python3.withPackages (ps: [ ps.pygobject3 ]))
+            ];
+            text = ''
+              export GI_TYPELIB_PATH=${pkgs.gst_all_1.gstreamer.out}/lib/girepository-1.0:"''${GI_TYPELIB_PATH:-}"
+              export GST_PLUGIN_SYSTEM_PATH_1_0=${pkgs.lib.makeSearchPath "lib/gstreamer-1.0" [ pkgs.gst_all_1.gstreamer.out pkgs.gst_all_1.gst-plugins-base pkgs.gst_all_1.gst-plugins-good pkgs.gst_all_1.gst-plugins-bad pkgs.pipewire ]}:"''${GST_PLUGIN_SYSTEM_PATH_1_0:-}"
+              export WALKINGPAD_DEMO_WALLPAPER=${promoWallpaper}
+              export WALKINGPAD_DEMO_DBUS_CONFIG=${pkgs.dbus}/share/dbus-1/session.conf
+              export XDG_DATA_DIRS=${pkgs.gnome-shell}/share/gsettings-schemas/gnome-shell-${pkgs.gnome-shell.version}:${pkgs.gsettings-desktop-schemas}/share/gsettings-schemas/gsettings-desktop-schemas-${pkgs.gsettings-desktop-schemas.version}:${pkgs.gnome-shell}/share:"''${XDG_DATA_DIRS:-/usr/local/share:/usr/share}"
+              exec python ${promoSource}/scripts/record-promo.py "$@"
+            '';
+          };
+
           # bubblewrap launcher: filesystem/process/network isolation while
           # exposing exactly one host resource — the system bus socket, which
           # is the only interface the CLI needs. "$@" forwards subcommands and
@@ -207,6 +238,7 @@
           };
           walkingpad-gnome-extension = walkingpad-gnome-extension;
           walkingpad-sandboxed = walkingpad-sandboxed;
+          walkingpad-promo = walkingpad-promo;
           default = walkingpad-sandboxed;
         });
 

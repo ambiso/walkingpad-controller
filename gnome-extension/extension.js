@@ -301,6 +301,10 @@ class WalkingPadIndicator extends QuickSettings.SystemIndicator {
         this.quickSettingsItems.push(this._toggle);
 
         this._days = [];
+        this._historyReply = null;
+        this._historyRevision = null;
+        this._historyRequest = 0;
+        this._sessionDate = null;
         this._hoveredDay = -1;
         this._historyTimeout = 0;
         this._historyBox = this._buildHistogram();
@@ -547,12 +551,17 @@ class WalkingPadIndicator extends QuickSettings.SystemIndicator {
     _refreshHistory() {
         if (this._destroyed)
             return;
+        const revision = this._state?.history_revision;
+        const request = ++this._historyRequest;
         this._link.command({cmd: 'history'}, reply => {
-            if (this._destroyed)
+            if (this._destroyed || request !== this._historyRequest)
                 return;
             try {
-                this._days = reply && reply.ok
-                    ? aggregateHistory(reply) : [];
+                this._historyReply = reply?.ok ? reply : null;
+                this._historyRevision = reply?.history_revision ?? revision;
+                this._sessionDate = reply?.current?.date ?? null;
+                this._days = aggregateHistory(this._historyReply);
+                this._updateLiveHistory();
             } catch (e) {
                 this._days = [];
             }
@@ -568,6 +577,26 @@ class WalkingPadIndicator extends QuickSettings.SystemIndicator {
             });
     }
 
+    _updateLiveHistory() {
+        const state = this._state;
+        // Keep the last chart until finalization has reached the history reply.
+        // Mixing new live counters with an older history would lose a session;
+        // mixing old counters with newer history would count it twice.
+        if (!this._historyReply || !state ||
+            state.history_revision !== this._historyRevision)
+            return;
+        if ((state.elapsed > 0 || state.steps > 0 || state.distance > 0) && !this._sessionDate)
+            this._sessionDate = isoLocalDate(new Date());
+        this._days = aggregateHistory({
+            history: this._historyReply.history,
+            current: this._sessionDate ? {
+                date: this._sessionDate,
+                session: {steps: state.steps, distance: state.distance},
+            } : null,
+        });
+        this._applyHistory();
+    }
+
     _applyHistory() {
         for (let i = 0; i < HISTORY_DAYS; i++) {
             const day = this._days[i];
@@ -578,7 +607,6 @@ class WalkingPadIndicator extends QuickSettings.SystemIndicator {
                     (day.today ? 'font-weight: bold;' : 'color: rgba(200, 200, 200, 0.75);');
             }
         }
-        this._hoveredDay = -1;
         this._updateCaption(this._state, this._running());
         if (this._chart)
             this._chart.queue_repaint();
@@ -611,12 +639,13 @@ class WalkingPadIndicator extends QuickSettings.SystemIndicator {
     _onState(state) {
         const previous = this._state;
         this._state = state;
+        this._updateLiveHistory();
         const running = this._running();
         if (running)
             this._clearCountdown();
         // Refresh on an actual finalization, including stop after pause or
         // a counter reset while the belt continues running.
-        if (previous && state.history_revision !== previous.history_revision)
+        if (!previous || state.history_revision !== previous.history_revision)
             this._refreshHistory();
 
         // Bounds arrive once the daemon has read them off the pad.
@@ -674,6 +703,8 @@ class WalkingPadIndicator extends QuickSettings.SystemIndicator {
             return;
         this._clearCountdown();
         this._state = null;
+        this._historyReply = null;
+        this._historyRequest++;
         this._toggle.checked = false;
         this._toggle.subtitle = 'daemon offline';
         this._icon.opacity = 40;
