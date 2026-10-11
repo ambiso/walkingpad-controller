@@ -58,7 +58,8 @@ def encode(capture, output, args, frame, clip_start):
         "vp9": ["-c:v", "libvpx-vp9", "-deadline", "good", "-cpu-used", "3",
                 "-row-mt", "1", "-threads", "8", "-crf", "32", "-b:v", "0"],
     }
-    container = ["-movflags", "+faststart"] if output.suffix == ".mp4" else []
+    container = (["-movflags", "+faststart"] if output.suffix == ".mp4" else
+                 ["-loop", "0"] if output.suffix == ".avif" else [])
     device = ["-vaapi_device", str(args.vaapi_device)] if hardware else []
     subprocess.run(["ffmpeg", "-hide_banner", "-loglevel", "warning", "-n",
                     "-filter_threads", "4", *device, "-threads", "4",
@@ -67,7 +68,8 @@ def encode(capture, output, args, frame, clip_start):
                     "-r", str(args.fps), "-fps_mode", "cfr",
                     *container, str(output)], check=True)
     stream = json.loads(subprocess.check_output([
-        "ffprobe", "-v", "error", "-select_streams", "v:0", "-show_entries",
+        "ffprobe", "-v", "error", "-select_streams",
+        "v:1" if output.suffix == ".avif" else "v:0", "-show_entries",
         "stream=width,height,sample_aspect_ratio", "-of", "json", str(output)],
         text=True))["streams"][0]
     if stream != {"width": output_width, "height": output_height,
@@ -299,11 +301,11 @@ def run(args):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("output", type=Path, nargs="?", default=Path("walkingpad-promo.mp4"))
+    parser.add_argument("output", type=Path, nargs="?", default=Path("walkingpad-promo.avif"))
     parser.add_argument("--resolution", default="3840x2160", help="virtual monitor WxH[@Hz] (default: 3840x2160 at twice the output fps)")
     parser.add_argument("--output-resolution", default="auto", help="encoded WxH, or auto for balanced menu crop (default)")
     parser.add_argument("--codec", choices=("av1", "av1-vaapi", "h264", "vp9"),
-                        help="encoder (default: AV1 for MP4, VP9 for WebM)")
+                        help="encoder (default: AV1 for AVIF/MP4, VP9 for WebM)")
     parser.add_argument("--fps", type=int, default=60)
     parser.add_argument("--vaapi-device", type=Path, default=Path("/dev/dri/renderD128"),
                         help="render node for VA-API output encoding")
@@ -311,13 +313,15 @@ def main():
                         help="intermediate capture encoder (default: VP8 for smooth pacing)")
     parser.add_argument("--keep-source", action="store_true", help="also keep the original WebM recording")
     args = parser.parse_args()
-    if args.output.suffix not in (".mp4", ".webm"):
-        parser.error("output must have an .mp4 or .webm extension")
+    if args.output.suffix not in (".avif", ".mp4", ".webm"):
+        parser.error("output must have an .avif, .mp4 or .webm extension")
     args.codec = args.codec or ("vp9" if args.output.suffix == ".webm" else "av1")
+    if args.output.suffix == ".avif" and args.codec not in ("av1", "av1-vaapi"):
+        parser.error("AVIF requires an AV1 encoder")
     if args.output.suffix == ".webm" and args.codec == "h264":
         parser.error("H.264 requires an .mp4 output")
     if args.keep_source and args.output.suffix == ".webm":
-        parser.error("--keep-source requires an .mp4 output to avoid conflicting WebM paths")
+        parser.error("--keep-source requires an .avif or .mp4 output to avoid conflicting WebM paths")
     match = re.fullmatch(r"(\d+)x(\d+)(?:@\d+(?:\.\d+)?)?", args.resolution)
     if not match or any(int(n) < 480 or int(n) % 2 for n in match.groups()):
         parser.error("resolution needs even dimensions of at least 480 pixels, e.g. 1280x720")

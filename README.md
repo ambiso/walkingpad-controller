@@ -9,7 +9,7 @@ Python sources live in `src/`, Nix modules and package definitions in
 Python regression tests with `python -m unittest discover -s tests`
 inside `nix develop`.
 
-[Watch the extension in action](docs/promo.mp4)
+![WalkingPad extension in action](docs/promo.avif)
 
 The promo shows the extension on GNOME 50: the WalkingPad toggle with live
 state and speed, the speed slider, and a seven-day steps histogram with
@@ -157,13 +157,13 @@ for the app again.
 On Linux, record the actual extension in a private headless GNOME Shell:
 
 ```sh
-nix run .#walkingpad-promo -- /tmp/walkingpad-promo.mp4
-# Optional: another monitor size and the original WebM alongside the MP4
-nix run .#walkingpad-promo -- /tmp/walkingpad-promo-small.mp4 --resolution 960x600 --keep-source
+nix run .#walkingpad-promo -- /tmp/walkingpad-promo.avif
+# Optional: another monitor size and the original WebM alongside the AVIF
+nix run .#walkingpad-promo -- /tmp/walkingpad-promo-small.avif --resolution 960x600 --keep-source
 ```
 
 The default uses a private 4K desktop with 4× UI scaling and produces a
-60 fps MP4, 1080 pixels high. Its width follows the menu, with balanced
+looping 60 fps animated AVIF, 1080 pixels high. Its width follows the menu, with balanced
 padding on opposite edges. The cursor and camera move immediately. A
 diagnostic `.log` is saved next to the video.
 Existing videos are never overwritten. Capture and encoding can take
@@ -210,7 +210,8 @@ it has been exercised with GNOME Shell 50.
 The driver is `scripts/record-promo.py`; cursor choreography and mock
 telemetry live in `scripts/promo/`. Use `--fps` to change the output frame
 rate, `--output-resolution` for encoded dimensions, and `--codec h264`
-for H.264 instead of the default AV1. A `.webm` output selects VP9 by
+with an `.mp4` output for H.264 instead of the default AV1. AVIF displays
+inline in the GitHub README as an animated image. A `.webm` output selects VP9 by
 default. Edit the driver's action sequence to change the tour.
 `--codec av1-vaapi` offloads final scaling and encoding to the GPU;
 the animated camera transform still runs on the CPU, limited to four threads.
