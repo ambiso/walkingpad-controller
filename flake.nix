@@ -171,12 +171,13 @@
               runHook preInstall
               mkdir -p "$out/share/gnome-shell/extensions/walkingpad@ambiso"
               cp -r "$src"/. "$out/share/gnome-shell/extensions/walkingpad@ambiso/"
+              cp ${./LICENSE} "$out/share/gnome-shell/extensions/walkingpad@ambiso/LICENSE"
               runHook postInstall
             '';
             passthru.extensionUuid = "walkingpad@ambiso";
             meta = {
               description = "GNOME Shell Quick Settings extension for the WalkingPad daemon";
-              license = pkgs.lib.licenses.mit;
+              license = pkgs.lib.licenses.eupl12;
             };
           };
 
