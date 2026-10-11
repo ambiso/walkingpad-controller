@@ -59,6 +59,7 @@ function aggregateHistory(reply) {
             date: isoLocalDate(d),
             steps: 0,
             meters: 0,
+            duration: 0,
             weekday: d.toLocaleDateString(undefined, {weekday: 'narrow'}),
             today: i === 0,
         };
@@ -74,6 +75,7 @@ function aggregateHistory(reply) {
         if (day) {
             day.steps += rec.steps || 0;
             day.meters += rec.distance || 0;
+            day.duration += rec.duration || 0;
         }
     }
     // The open session counts toward today (it is real activity even
@@ -85,6 +87,7 @@ function aggregateHistory(reply) {
         if (day) {
             day.steps += sess.steps || 0;
             day.meters += sess.distance || 0;
+            day.duration += sess.duration || 0;
         }
     }
     return days;
@@ -591,7 +594,7 @@ class WalkingPadIndicator extends QuickSettings.SystemIndicator {
             history: this._historyReply.history,
             current: this._sessionDate ? {
                 date: this._sessionDate,
-                session: {steps: state.steps, distance: state.distance},
+                session: {steps: state.steps, distance: state.distance, duration: state.elapsed},
             } : null,
         });
         this._applyHistory();
@@ -619,7 +622,7 @@ class WalkingPadIndicator extends QuickSettings.SystemIndicator {
         if (hovered) {
             const km = (hovered.meters / 1000).toFixed(2);
             this._caption.text =
-                `${hovered.date}: ${hovered.steps.toLocaleString()} steps · ${km} km`;
+                `${hovered.date}: ${this._formatDuration(hovered.duration)} · ${hovered.steps.toLocaleString()} steps · ${km} km`;
         } else if (running && state) {
             const km = (state.distance / 1000).toFixed(2);
             this._caption.text =
