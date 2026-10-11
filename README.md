@@ -81,6 +81,15 @@ gnome-extensions enable walkingpad@ambiso
 
 Open the top-right Quick Settings menu to find the WalkingPad controls.
 
+## Safety and access
+
+This software controls moving exercise equipment. Software, Bluetooth, or
+computer failures may prevent commands from reaching the pad. Follow the
+manufacturer’s instructions and keep the pad’s physical controls accessible;
+do not rely on this application for emergency stopping. Activity statistics
+are estimates, not medical measurements. Every local user can control the pad
+through the daemon’s socket.
+
 ## Using the pad
 
 Turn on the WalkingPad toggle to start walking. The extension shows a 3–2–1

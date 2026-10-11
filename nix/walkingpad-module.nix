@@ -54,6 +54,7 @@ let
   # below) and the directory is traversable, so any user's
   # `walkingpad-client history` can read the totals.
   historyPath = "/var/lib/walkingpad/history.jsonl";
+  proxySocket = "/run/walkingpad-dbus/bus";
 in
 {
   options.services.walkingpad = {
@@ -85,21 +86,54 @@ in
   };
 
   config = lib.mkIf cfg.enable {
+    users.groups.walkingpad-dbus = { };
+
+    # Separate UID: compromised Python cannot modify the proxy process.
+    systemd.services.walkingpad-dbus = {
+      description = "BlueZ-only D-Bus proxy for WalkingPad";
+      requires = [ "dbus.service" ];
+      after = [ "dbus.service" ];
+      partOf = [ "walkingpad.service" ];
+      serviceConfig = {
+        ExecStart = "${pkgs.xdg-dbus-proxy}/bin/xdg-dbus-proxy unix:path=/run/dbus/system_bus_socket ${proxySocket} --filter --talk=org.bluez";
+        ExecStartPost = pkgs.writeShellScript "walkingpad-dbus-ready" ''
+          while [ ! -S ${proxySocket} ]; do ${pkgs.coreutils}/bin/sleep 0.01; done
+          ${pkgs.coreutils}/bin/chmod 0660 ${proxySocket}
+        '';
+        TimeoutStartSec = 10;
+        Restart = "on-failure";
+        RestartSec = 1;
+        DynamicUser = true;
+        Group = "walkingpad-dbus";
+        RuntimeDirectory = "walkingpad-dbus";
+        RuntimeDirectoryMode = "0750";
+        UMask = "0007";
+        NoNewPrivileges = true;
+        CapabilityBoundingSet = "";
+        RestrictAddressFamilies = [ "AF_UNIX" ];
+        PrivateNetwork = true;
+        PrivateTmp = true;
+        PrivateDevices = true;
+        ProtectHome = true;
+        ProtectSystem = "strict";
+        ProtectProc = "invisible";
+        RestrictNamespaces = true;
+        SystemCallArchitectures = "native";
+      };
+    };
+
     systemd.services.walkingpad = {
       description = "WalkingPad BLE control daemon (persistent link, JSON-lines control socket)";
 
       # BlueZ is reached through the D-Bus system bus, which is up once
       # dbus.service is; bluetooth.target additionally waits for the
       # adapter. The daemon needs no network, only those.
-      after = [ "bluetooth.target" "dbus.service" ];
-      wants = [ "bluetooth.target" ];
+      after = [ "bluetooth.target" "walkingpad-dbus.service" ];
+      # Let the daemon retry even if the proxy initially fails to start.
+      wants = [ "bluetooth.target" "walkingpad-dbus.service" ];
       wantedBy = [ "multi-user.target" ];
 
-      # dbus-fast falls back to /var/run/dbus/system_bus_socket when this
-      # variable is unset, which is dead on hosts where /var/run is not a
-      # symlink to /run. Pin the canonical path explicitly.
-      environment.DBUS_SYSTEM_BUS_ADDRESS =
-        "unix:path=/run/dbus/system_bus_socket";
+      environment.DBUS_SYSTEM_BUS_ADDRESS = "unix:path=${proxySocket}";
 
       serviceConfig = {
         ExecStart = lib.concatStringsSep " " (
@@ -122,6 +156,12 @@ in
         # -- sandbox ------------------------------------------------------
         # No persistent identity: a fresh UID is allocated per boot.
         DynamicUser = true;
+        SupplementaryGroups = [ "walkingpad-dbus" ];
+        # Hide the real bus, including the /var/run alias. A private network
+        # namespace also prevents bypass through host abstract Unix sockets.
+        InaccessiblePaths = [ "/run/dbus" ];
+        PrivateNetwork = true;
+        ProtectProc = "invisible";
 
         # /run/walkingpad is created for the dynamic user and owned by it;
         # mode 0755 keeps the directory traversable for client users, who

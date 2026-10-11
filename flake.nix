@@ -212,19 +212,37 @@
             '';
           };
 
-          # bubblewrap launcher: filesystem/process/network isolation while
-          # exposing exactly one host resource — the system bus socket, which
-          # is the only interface the CLI needs. "$@" forwards subcommands and
-          # options to the CLI inside the sandbox.
+          # Keep the proxy outside the PID/network namespaces. Only its
+          # filtered socket is mounted inside the CLI sandbox.
           walkingpad-sandboxed = pkgs.writeShellScriptBin "walkingpad-sandboxed" ''
-            exec ${pkgs.bubblewrap}/bin/bwrap \
+            set -euo pipefail
+            proxy_dir=$(${pkgs.coreutils}/bin/mktemp -d)
+            proxy_pid=
+            cleanup() {
+              if [ -n "$proxy_pid" ]; then
+                kill "$proxy_pid" 2>/dev/null || true
+                wait "$proxy_pid" 2>/dev/null || true
+              fi
+              ${pkgs.coreutils}/bin/rm -rf "$proxy_dir"
+            }
+            trap cleanup EXIT
+            trap 'exit 130' INT
+            trap 'exit 143' TERM
+            coproc BLUEZ_PROXY {
+              exec ${pkgs.xdg-dbus-proxy}/bin/xdg-dbus-proxy \
+                unix:path=/run/dbus/system_bus_socket "$proxy_dir/bus" \
+                --filter --talk=org.bluez --fd=1
+            }
+            proxy_pid=$!
+            read -r -N 1 -t 10 -u "''${BLUEZ_PROXY[0]:?D-Bus proxy exited before readiness}" ready
+            ${pkgs.bubblewrap}/bin/bwrap \
               --unshare-all \
               --die-with-parent \
               --proc /proc \
               --dev /dev \
               --tmpfs /tmp \
               --ro-bind /nix /nix \
-              --ro-bind-try /run/dbus/system_bus_socket /run/dbus/system_bus_socket \
+              --ro-bind "$proxy_dir/bus" /run/dbus/system_bus_socket \
               --setenv DBUS_SYSTEM_BUS_ADDRESS unix:path=/run/dbus/system_bus_socket \
               ${walkingpad-cli}/bin/walkingpad "$@"
           '';
