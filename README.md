@@ -135,6 +135,35 @@ for the accounting rules and limitations.
 
 ## More information
 
-- [Development, tests, and credits](docs/development.md)
+- [Development and tests](docs/development.md)
 - [Daemon and session accounting](docs/architecture.md)
 - [Recording and tuning the demo](docs/promo.md)
+
+## License
+
+Copyright © 2026 ambiso and contributors.
+
+The project's original code is licensed under the
+[European Union Public Licence 1.2](LICENSE) (SPDX: `EUPL-1.2`).
+Third-party code and artwork retain their respective licenses.
+
+## Credits
+
+- **[slandau3/z1-walkingpad-mcp](https://github.com/slandau3/z1-walkingpad-mcp)** —
+  a macOS client for the same pad; its
+  protocol write-up (MIT) is the basis for the daemon's frame formats
+  and the vendor unlock handshake.
+- **[mcdax/walkingpad-controller](https://github.com/mcdax/walkingpad-controller)** —
+  the Python library (MIT) this repo packages; the one-shot CLI is
+  built on it.
+- **[anativ/R1-Walkingpad-Controller](https://github.com/anativ/R1-Walkingpad-Controller)** —
+  an additional protocol reference.
+- **duttke.de** — the Web Bluetooth implementation of the Z1 protocol.
+
+## AI assistance
+
+This project was developed with substantial AI assistance, including Mistral Vibe
+and OpenAI Codex, using the [credited protocol references](#credits). Development has
+included use with a KS-HD-Z1E (firmware J41_V301.10.22), offline tests, and mocked
+demo sessions. Individual behaviors should not be assumed to have been verified
+on hardware solely because the parser or a test covers them.
