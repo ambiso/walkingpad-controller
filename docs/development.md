@@ -21,6 +21,14 @@ nix develop -c python -m unittest discover -s tests
 nix shell nixpkgs#nodejs -c node --test tests/test_extension.js tests/test_promo_motion.mjs
 ```
 
+The D-Bus integration test uses a private bus and the real proxy to check that
+BlueZ calls and notifications pass while unrelated services and name ownership
+are blocked. It skips when the D-Bus tools are unavailable; to include it, run:
+
+```sh
+nix shell nixpkgs#xdg-dbus-proxy nixpkgs#dbus --command nix develop -c python -m unittest discover -s tests
+```
+
 Python tests exercise session accounting and command handling using mocked
 connections. Extension tests execute the history-update methods with actor and
 socket stubs, including asynchronous replies, session finalization, live duration,
@@ -63,7 +71,9 @@ module's socket path, `/run/walkingpad/daemon.sock`.
 `walkingpad-cli` (executable `walkingpad`) and `walkingpad-sandboxed` provide
 one-shot `scan`, `info`, `start`, `speed`, and `stop` commands using the upstream
 [walkingpad-controller](https://github.com/mcdax/walkingpad-controller) library.
-The sandboxed variant uses bubblewrap and exposes the host system D-Bus for BlueZ.
+The sandboxed variant uses bubblewrap and exposes a filtered D-Bus socket
+that permits BlueZ access. Its proxy stays outside the sandbox and exits when
+the command finishes.
 The persistent daemon implements its own vendor unlock, so use it for the Z1
 control path described in the README; the library-based tools are separate.
 

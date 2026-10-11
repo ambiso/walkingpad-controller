@@ -18,7 +18,11 @@ reconnecting; keeping the daemon running avoids opening a new connection for
 every client command.
 
 The NixOS module runs the daemon under a dynamic systemd user, with filesystem
-hardening and only AF_UNIX sockets allowed. Bluetooth access goes through D-Bus.
+hardening and only AF_UNIX sockets allowed. Bluetooth access goes through a
+separate `xdg-dbus-proxy` service that permits calls and notifications for
+`org.bluez`. The daemon cannot access the raw system bus, and the proxy runs
+under a separate user. This still permits access to other Bluetooth devices
+through BlueZ; it is not a restriction to the configured pad.
 The control socket is writable by every local user, so every local user can
 control the belt. Session history is retrieved through the socket as well.
 
