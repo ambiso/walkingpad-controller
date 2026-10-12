@@ -139,6 +139,9 @@ in
       wantedBy = [ "multi-user.target" ];
 
       environment.DBUS_SYSTEM_BUS_ADDRESS = "unix:path=${proxySocket}";
+      # The proxy authenticates upstream with its own UID. Omit the client's
+      # explicit UID so EXTERNAL authentication uses the socket credentials.
+      environment.BLEAK_DBUS_AUTH_UID = "-1";
 
       serviceConfig = {
         ExecStart = lib.concatStringsSep " " (

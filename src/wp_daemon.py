@@ -311,9 +311,12 @@ async def bluez_force_disconnect(address):
     try:
         from dbus_fast import BusType, Message
         from dbus_fast.aio import MessageBus
+        from dbus_fast.auth import AuthExternal, UID_NOT_SPECIFIED
     except ImportError:
         return False
-    bus = await MessageBus(bus_type=BusType.SYSTEM).connect()
+    bus = await MessageBus(
+        bus_type=BusType.SYSTEM,
+        auth=AuthExternal(uid=UID_NOT_SPECIFIED)).connect()
     try:
         reply = await bus.call(Message(
             destination="org.bluez", path="/",
