@@ -8,14 +8,25 @@ const vm = require('node:vm');
 const source = fs.readFileSync(path.join(__dirname, '../gnome-extension/extension.js'), 'utf8')
     .replace(/^import .*;$/gm, '')
     .replace('export default class', 'class');
+const timers = new Map();
+let nextTimer = 1;
 const context = vm.createContext({
     TextDecoder, Date,
     Gio: {}, Clutter: {}, St: {}, Main: {}, Extension: class {},
-    GLib: {PRIORITY_DEFAULT: 0, source_remove() {}, timeout_add_seconds() { return 1; }},
+    GLib: {
+        PRIORITY_DEFAULT: 0, SOURCE_REMOVE: false,
+        source_remove(id) { timers.delete(id); },
+        timeout_add_seconds() { return 1; },
+        timeout_add(priority, milliseconds, callback) {
+            const id = nextTimer++;
+            timers.set(id, {milliseconds, callback});
+            return id;
+        },
+    },
     GObject: {registerClass: cls => cls},
     QuickSettings: {SystemIndicator: class {}},
 });
-vm.runInContext(`${source}\nglobalThis.Indicator = WalkingPadIndicator;`, context);
+vm.runInContext(`${source}\nglobalThis.Indicator = WalkingPadIndicator; globalThis.DaemonLink = DaemonLink;`, context);
 
 function date(offset = 0) {
     const value = new Date();
@@ -29,17 +40,21 @@ function state(changes = {}) {
 }
 function setup() {
     const requests = [];
+    const commands = [];
     const indicator = Object.create(context.Indicator.prototype);
     Object.assign(indicator, {
         _state: null, _days: [], _historyReply: null, _historyRevision: null,
         _historyRequest: 0, _sessionDate: null, _hoveredDay: -1,
         _countdown: 0, _countdownTimeout: 0, _historyTimeout: 0,
-        _pendingSpeed: null, _lo: 1, _hi: 6, _slider: {value: 0.4},
+        _pendingSpeed: null, _speedTimeout: 0, _sendingSpeed: false,
+        _speedRequest: null, _queuedSpeed: null, _lo: 1, _hi: 6, _slider: {value: 0.4},
         _chart: {queue_repaint() {}}, _caption: {}, _toggle: {}, _sliderItem: {}, _icon: {},
         _weekdayLabels: Array.from({length: 7}, () => ({})),
-        _link: {command(request, callback) { requests.push(callback); }},
+        _link: {command(request, callback) {
+            requests.push(callback); commands.push({request, callback});
+        }},
     });
-    return {indicator, requests};
+    return {indicator, requests, commands};
 }
 function history(revision = 0, currentDate = date(), steps = 16) {
     return {ok: true, history_revision: revision,
@@ -121,4 +136,130 @@ test('steps-only telemetry creates a live bar before duration is reported', () =
     requests.at(-1)(history(0, null));
     indicator._onState(state({steps: 2, elapsed: 0, distance: 0}));
     assert.equal(today(indicator).steps, 2302);
+});
+
+
+test('scroll sends immediately and newer targets survive older telemetry and replies', () => {
+    const {indicator, commands} = setup();
+    indicator._onState(state());
+    indicator._slider.value = 0.6; // 4 km/h
+    indicator._onSliderValue();
+    const first = commands.at(-1);
+    assert.equal(first.request.speed, 4);
+    const oldTimer = indicator._speedTimeout;
+    indicator._slider.value = 0.8; // 5 km/h while first command is in flight
+    indicator._onSliderValue();
+    assert.equal(commands.at(-1), first);
+    assert.equal(timers.has(oldTimer), false);
+    indicator._onState(state({speed: 4}));
+    assert.equal(indicator._targetSpeed(), 5);
+    assert.equal(indicator._displaySpeed(indicator._state), 5);
+    first.callback({ok: false}); // even failure of an older request cannot release the hold
+    const latest = commands.at(-1);
+    assert.equal(latest.request.speed, 5);
+    latest.callback({ok: true});
+    indicator._onState(state({speed: 4.5}));
+    assert.equal(indicator._targetSpeed(), 5);
+    indicator._onState(state({speed: 5}));
+    assert.equal(indicator._pendingSpeed, null);
+    assert.equal(indicator._speedTimeout, 0);
+});
+
+test('unconfirmed speed falls back after three seconds even without new telemetry', () => {
+    const {indicator} = setup();
+    indicator._onState(state());
+    indicator._slider.value = 0.8;
+    indicator._onSliderValue();
+    const timer = timers.get(indicator._speedTimeout);
+    assert.equal(timer.milliseconds, 3000);
+    timer.callback();
+    assert.equal(indicator._pendingSpeed, null);
+    assert.equal(indicator._targetSpeed(), 3);
+    assert.match(indicator._toggle.subtitle, /3.0 km\/h/);
+});
+
+test('a failed latest speed request releases the hold immediately', () => {
+    const {indicator, commands} = setup();
+    indicator._onState(state());
+    indicator._slider.value = 0.8;
+    indicator._onSliderValue();
+    commands.at(-1).callback(null);
+    assert.equal(indicator._pendingSpeed, null);
+    assert.equal(indicator._targetSpeed(), 3);
+});
+
+test('drag remains user-controlled and commits on release', () => {
+    const {indicator, commands} = setup();
+    indicator._onState(state());
+    const before = commands.length;
+    indicator._dragging = true;
+    indicator._slider.value = 0.8;
+    indicator._onSliderValue();
+    indicator._onState(state({speed: 4}));
+    assert.equal(commands.length, before);
+    assert.equal(indicator._targetSpeed(), 5);
+    indicator._dragging = false;
+    indicator._commitSpeed();
+    assert.equal(commands.at(-1).request.speed, 5);
+});
+
+
+test('command failures complete the callback so the speed queue can recover', () => {
+    const originalGio = context.Gio;
+    try {
+        for (const failure of ['connect', 'write', 'read', 'eof', 'malformed', null]) {
+            const replies = [];
+            let closed = false;
+            const connection = {
+                get_output_stream() { return {write_all() {
+                    if (failure === 'write') throw new Error('write failed');
+                }}; },
+                get_input_stream() { return {}; },
+                close() { closed = true; },
+            };
+            context.Gio = {
+                UnixSocketAddress: {new() { return {}; }},
+                SocketClient: class {
+                    connect_async(address, cancellable, callback) { callback(this, {}); }
+                    connect_finish() {
+                        if (failure === 'connect') throw new Error('connect failed');
+                        return connection;
+                    }
+                },
+                DataInputStream: class {
+                    read_line_async(priority, cancellable, callback) { callback(this, {}); }
+                    read_line_finish() {
+                        if (failure === 'read') throw new Error('read failed');
+                        const value = failure === 'eof' ? null : Buffer.from(
+                            failure === 'malformed' ? '{' : '{"ok":true}');
+                        return [value];
+                    }
+                },
+            };
+            const link = new context.DaemonLink(() => {}, () => {});
+            link.command({cmd: 'speed', speed: 4}, reply => replies.push(reply));
+            assert.equal(replies.length, 1, failure);
+            if (failure) assert.equal(replies[0], null, failure);
+            else assert.equal(replies[0].ok, true);
+            assert.equal(closed, failure !== 'connect');
+        }
+    } finally {
+        context.Gio = originalGio;
+    }
+});
+
+
+test('display timeout does not discard the latest unsent speed change', () => {
+    const {indicator, commands} = setup();
+    indicator._onState(state());
+    indicator._slider.value = 0.6;
+    indicator._onSliderValue();
+    const first = commands.at(-1);
+    indicator._slider.value = 0.8;
+    indicator._onSliderValue();
+    timers.get(indicator._speedTimeout).callback();
+    assert.equal(indicator._targetSpeed(), 3);
+    first.callback({ok: true});
+    assert.equal(commands.at(-1).request.speed, 5);
+    assert.equal(indicator._pendingSpeed, null);
 });
