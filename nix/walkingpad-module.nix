@@ -94,6 +94,9 @@ in
       requires = [ "dbus.service" ];
       after = [ "dbus.service" ];
       partOf = [ "walkingpad.service" ];
+      # A switch must also start a previously failed proxy when the daemon
+      # stayed running; Wants from an already-active service is not retriggered.
+      wantedBy = [ "multi-user.target" ];
       serviceConfig = {
         ExecStart = "${pkgs.xdg-dbus-proxy}/bin/xdg-dbus-proxy unix:path=/run/dbus/system_bus_socket ${proxySocket} --filter --talk=org.bluez";
         ExecStartPost = pkgs.writeShellScript "walkingpad-dbus-ready" ''
