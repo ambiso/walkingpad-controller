@@ -22,9 +22,7 @@ import {Extension} from 'resource:///org/gnome/shell/extensions/extension.js';
 
 const SOCKET_PATH = '/run/walkingpad/daemon.sock';
 const RECONNECT_SECONDS = 3;
-// The pad enforces ~400 ms pacing between BLE writes; committing on a
-// short delay also coalesces a drag into one command.
-const SPEED_COMMIT_MS = 500;
+const SPEED_CONFIRM_MS = 3000;
 
 // Session history served by the daemon over the control socket
 // ({"cmd": "history"}): the state directory belongs to the service's
@@ -207,6 +205,7 @@ class DaemonLink {
                 conn = c.connect_finish(res);
             } catch (e) {
                 this._onDown();
+                onReply?.(null);
                 return;
             }
             const out = conn.get_output_stream();
@@ -214,20 +213,21 @@ class DaemonLink {
                 out.write_all(JSON.stringify(request) + '\n', null);
             } catch (e) {
                 conn.close(null);
+                onReply?.(null);
                 return;
             }
             const din = new Gio.DataInputStream({
                 base_stream: conn.get_input_stream(),
             });
             din.read_line_async(GLib.PRIORITY_DEFAULT, null, (in_, res) => {
+                let reply = null;
                 try {
                     const [line] = in_.read_line_finish(res);
                     if (line !== null) {
                         const msg = JSON.parse(decoder.decode(line));
                         if (msg && msg.state)
                             this._onState(msg.state);
-                        if (onReply)
-                            onReply(msg);
+                        reply = msg;
                     }
                 } catch (e) {
                     // Reply lost; the watch stream resyncs the UI anyway.
@@ -238,6 +238,7 @@ class DaemonLink {
                         // already dead
                     }
                 }
+                onReply?.(reply);
             });
         });
     }
@@ -249,12 +250,14 @@ class WalkingPadIndicator extends QuickSettings.SystemIndicator {
         super._init();
 
         this._state = null;
-        this._commitTimeout = 0;
+        this._speedTimeout = 0;
         this._reconnectTimeout = 0;
         this._syncing = false;
         this._destroyed = false;
         this._pendingSpeed = null;   // slider value awaiting pad confirmation
-        this._pendingSince = 0;
+        this._speedRequest = null;
+        this._queuedSpeed = null;
+        this._sendingSpeed = false;
         this._countdown = 0;
         this._countdownTimeout = 0;
 
@@ -276,8 +279,8 @@ class WalkingPadIndicator extends QuickSettings.SystemIndicator {
 
         // GNOME 50's QuickSlider wraps a normalized (0..1) Slider exposed
         // as .slider; speed is mapped into that range from the pad's
-        // reported bounds. Commits happen on drag-end (plus a debounce
-        // for scroll/keyboard changes).
+        // reported bounds. Drags commit on release; scroll/keyboard changes
+        // send immediately, with only the latest unsent value retained.
         this._lo = 1.0;
         this._hi = 6.0;
         this._dragging = false;
@@ -290,7 +293,7 @@ class WalkingPadIndicator extends QuickSettings.SystemIndicator {
         this._slider = this._sliderItem.slider;
         this._slider.connect('drag-begin', () => {
             this._dragging = true;
-            this._cancelSpeedCommit();
+            this._clearPendingSpeed(true);
         });
         this._slider.connect('drag-end', () => {
             this._dragging = false;
@@ -333,6 +336,7 @@ class WalkingPadIndicator extends QuickSettings.SystemIndicator {
             this._link.command({cmd: 'start', speed: this._targetSpeed()});
         } else {
             this._clearCountdown();
+            this._clearPendingSpeed(true);
             this._link.command({cmd: 'stop'});
         }
     }
@@ -388,50 +392,59 @@ class WalkingPadIndicator extends QuickSettings.SystemIndicator {
     }
 
     _onSliderValue() {
-        if (this._syncing)
-            return;
-        if (this._dragging)
-            return;  // one command when the drag ends, not per motion
-        this._cancelSpeedCommit();
-        this._commitTimeout = GLib.timeout_add(GLib.PRIORITY_DEFAULT, SPEED_COMMIT_MS, () => {
-            this._commitTimeout = 0;
+        if (!this._syncing && !this._dragging)
             this._commitSpeed();
-            return GLib.SOURCE_REMOVE;
-        });
     }
 
-    _cancelSpeedCommit() {
-        if (this._commitTimeout) {
-            GLib.source_remove(this._commitTimeout);
-            this._commitTimeout = 0;
-        }
+    _clearPendingSpeed(cancelQueued = false) {
+        if (this._speedTimeout)
+            GLib.source_remove(this._speedTimeout);
+        this._speedTimeout = 0;
+        this._pendingSpeed = null;
+        this._speedRequest = null;
+        if (cancelQueued)
+            this._queuedSpeed = null;
     }
 
     _commitSpeed() {
-        // Any queued (debounced) commit is superseded: the last user
-        // action wins, never a stale intermediate value.
-        this._cancelSpeedCommit();
-        // Hold the committed speed optimistically until the pad reports
-        // it (or the commit is presumed lost); snapping back to the
-        // stale state for ~1 s reads as a rejected drag.
+        this._clearPendingSpeed();
         this._pendingSpeed = this._targetSpeed();
-        this._pendingSince = GLib.get_monotonic_time();
-        this._link.command({cmd: 'speed', speed: this._pendingSpeed});
+        this._speedRequest = {cmd: 'speed', speed: this._pendingSpeed};
+        this._queuedSpeed = this._speedRequest;
+        // Expiry releases only the display hold, not an unsent command.
+        this._speedTimeout = GLib.timeout_add(GLib.PRIORITY_DEFAULT, SPEED_CONFIRM_MS, () => {
+            this._clearPendingSpeed();
+            if (this._state)
+                this._onState(this._state);
+            return GLib.SOURCE_REMOVE;
+        });
+        this._sendSpeed();
+        if (this._state)
+            this._onState(this._state);
+    }
+
+    _sendSpeed() {
+        if (this._destroyed || this._sendingSpeed || !this._queuedSpeed)
+            return;
+        const request = this._queuedSpeed;
+        this._queuedSpeed = null;
+        this._sendingSpeed = true;
+        this._link.command(request, reply => {
+            this._sendingSpeed = false;
+            if (this._destroyed)
+                return;
+            // A failed older request cannot discard newer user input.
+            if (!reply?.ok && request === this._speedRequest) {
+                this._clearPendingSpeed();
+                if (this._state)
+                    this._onState(this._state);
+            }
+            this._sendSpeed();
+        });
     }
 
     _displaySpeed(state) {
-        if (this._pendingSpeed !== null) {
-            // Clear the hold the moment the pad confirms the speed (or
-            // after a real 5 s — get_monotonic_time is microseconds).
-            if (Math.abs(state.speed - this._pendingSpeed) <= 0.05 ||
-                GLib.get_monotonic_time() - this._pendingSince
-                    > 5 * GLib.USEC_PER_SEC) {
-                this._pendingSpeed = null;  // presumed lost; the pad wins
-            } else {
-                return this._pendingSpeed;
-            }
-        }
-        return state.speed;
+        return this._dragging ? this._targetSpeed() : (this._pendingSpeed ?? state.speed);
     }
 
     _running() {
@@ -657,6 +670,10 @@ class WalkingPadIndicator extends QuickSettings.SystemIndicator {
         if (state.max_speed !== null && state.max_speed > this._lo)
             this._hi = state.max_speed;
 
+        if (!this._dragging && this._pendingSpeed !== null && !this._queuedSpeed &&
+            Math.abs(state.speed - this._pendingSpeed) <= 0.05)
+            this._clearPendingSpeed();
+
         // Reflect the pad in the slider unless the user is dragging it or
         // a committed speed is still awaiting confirmation.
         if (running && !this._dragging && this._pendingSpeed === null &&
@@ -705,6 +722,7 @@ class WalkingPadIndicator extends QuickSettings.SystemIndicator {
         if (this._destroyed)
             return;
         this._clearCountdown();
+        this._clearPendingSpeed(true);
         this._state = null;
         this._historyReply = null;
         this._historyRequest++;
@@ -725,8 +743,7 @@ class WalkingPadIndicator extends QuickSettings.SystemIndicator {
         this._destroyed = true;
         this._link.stop();
         this._clearCountdown();
-        if (this._commitTimeout)
-            GLib.source_remove(this._commitTimeout);
+        this._clearPendingSpeed(true);
         if (this._reconnectTimeout)
             GLib.source_remove(this._reconnectTimeout);
         if (this._historyTimeout)
