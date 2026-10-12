@@ -23,6 +23,10 @@ separate `xdg-dbus-proxy` service that permits calls and notifications for
 `org.bluez`. The daemon cannot access the raw system bus, and the proxy runs
 under a separate user. This still permits access to other Bluetooth devices
 through BlueZ; it is not a restriction to the configured pad.
+Clients use EXTERNAL authentication without an explicit UID, so the system bus
+uses the proxy's kernel-provided credentials. The NixOS service sets
+`BLEAK_DBUS_AUTH_UID=-1` for Bleak; the daemon's direct D-Bus calls use the same
+authentication mode. The proxy remains unprivileged and enforces its filter.
 The control socket is writable by every local user, so every local user can
 control the belt. Session history is retrieved through the socket as well.
 

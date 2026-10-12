@@ -10,6 +10,8 @@ import unittest
 try:
     from dbus_fast import Message, MessageType
     from dbus_fast.aio import MessageBus
+    from dbus_fast.auth import AuthExternal, UID_NOT_SPECIFIED
+    from dbus_fast.errors import AuthError
     from dbus_fast.service import ServiceInterface, method, signal
 except ImportError:
     MessageBus = None
@@ -67,8 +69,18 @@ class ProxyTests(unittest.IsolatedAsyncioTestCase):
                     ready = await asyncio.wait_for(
                         asyncio.to_thread(os.read, read_fd, 1), 5)
                     self.assertEqual(ready, b"x")
+                    # A proxy forwards auth bytes but supplies its own kernel
+                    # credentials: an explicit different UID must be rejected.
+                    mismatched = MessageBus(bus_address=f"unix:path={directory}/bus",
+                                            auth=AuthExternal(uid=os.getuid() + 1))
+                    try:
+                        with self.assertRaises(AuthError):
+                            await asyncio.wait_for(mismatched.connect(), 5)
+                    finally:
+                        mismatched.disconnect()
                     client = await MessageBus(
-                        bus_address=f"unix:path={directory}/bus").connect()
+                        bus_address=f"unix:path={directory}/bus",
+                        auth=AuthExternal(uid=UID_NOT_SPECIFIED)).connect()
                     buses.append(client)
                     for name, expected in [("org.bluez", MessageType.METHOD_RETURN),
                                            ("org.example.Other", MessageType.ERROR),
