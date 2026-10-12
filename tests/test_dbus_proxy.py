@@ -85,13 +85,20 @@ class ProxyTests(unittest.IsolatedAsyncioTestCase):
                     updated = asyncio.Event()
                     client.add_message_handler(lambda msg: updated.set()
                         if msg.message_type == MessageType.SIGNAL and msg.member == "Updated" else None)
-                    reply = await client.call(Message(destination="org.freedesktop.DBus",
-                        path="/org/freedesktop/DBus", interface="org.freedesktop.DBus",
-                        member="AddMatch", signature="s", body=[
-                            "type='signal',sender='org.bluez',interface='org.example.Test'"]))
-                    self.assertEqual(reply.message_type, MessageType.METHOD_RETURN)
-                    interface.Updated("telemetry")
-                    await asyncio.wait_for(updated.wait(), 5)
+                    # Bleak also subscribes without a sender constraint.
+                    for sender in ["sender='org.bluez',", ""]:
+                        rule = f"type='signal',{sender}interface='org.example.Test'"
+                        reply = await client.call(Message(destination="org.freedesktop.DBus",
+                            path="/org/freedesktop/DBus", interface="org.freedesktop.DBus",
+                            member="AddMatch", signature="s", body=[rule]))
+                        self.assertEqual(reply.message_type, MessageType.METHOD_RETURN)
+                        updated.clear()
+                        interface.Updated("telemetry")
+                        await asyncio.wait_for(updated.wait(), 5)
+                        reply = await client.call(Message(destination="org.freedesktop.DBus",
+                            path="/org/freedesktop/DBus", interface="org.freedesktop.DBus",
+                            member="RemoveMatch", signature="s", body=[rule]))
+                        self.assertEqual(reply.message_type, MessageType.METHOD_RETURN)
                 finally:
                     os.close(read_fd)
                     proxy.terminate()

@@ -104,6 +104,8 @@ in
         Restart = "on-failure";
         RestartSec = 1;
         DynamicUser = true;
+        # The dynamic user must not share a name with the static access group.
+        User = "walkingpad-proxy";
         Group = "walkingpad-dbus";
         RuntimeDirectory = "walkingpad-dbus";
         RuntimeDirectoryMode = "0750";
