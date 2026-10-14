@@ -724,6 +724,7 @@ class Pad:
                     raise ReconnectRequested()
 
     async def run(self):
+        last_error = None
         while True:
             try:
                 await self.connect_once()
@@ -731,10 +732,15 @@ class Pad:
                 raise
             except Exception as exc:
                 immediate = isinstance(exc, ReconnectRequested)
-                print("walkingpad: %s; reconnecting %s"
-                      % (exc, "immediately" if immediate
-                         else "in %.0fs" % self.reconnect_delay),
-                      file=sys.stderr)
+                error = (type(exc), str(exc))
+                # An unavailable pad is normal between uses. Report changes,
+                # and fresh failures after connecting, without logging every retry.
+                if immediate or self.state["connected"] or error != last_error:
+                    print("walkingpad: %s; reconnecting %s"
+                          % (exc, "immediately" if immediate
+                             else "in %.0fs" % self.reconnect_delay),
+                          file=sys.stderr)
+                last_error = None if immediate else error
                 if self.client is not None:
                     try:
                         await self.client.disconnect()
