@@ -4,6 +4,7 @@ import argparse
 import asyncio
 import contextlib
 import importlib.util
+import io
 import json
 from pathlib import Path
 import tempfile
@@ -275,6 +276,35 @@ class NotificationTests(unittest.TestCase):
         self.pad._set(belt="stopped")
         self.assertEqual(self.pad.sessions.live(), counters())
         self.assertEqual(self.pad.sessions.read(), [])
+
+
+class ReconnectTests(unittest.IsolatedAsyncioTestCase):
+    async def test_repeated_errors_are_quiet_but_changes_and_link_loss_are_logged(self):
+        pad = make_pad()
+        attempts = 0
+
+        async def connect():
+            nonlocal attempts
+            attempts += 1
+            if attempts == 6:
+                raise asyncio.CancelledError()
+            if attempts == 5:
+                pad._set(connected=True)
+            raise RuntimeError("pad unavailable" if attempts <= 2
+                               else "connection lost")
+
+        pad.connect_once = connect
+        pad._idle_wait = AsyncMock(return_value=False)
+        output = io.StringIO()
+        with contextlib.redirect_stderr(output):
+            with self.assertRaises(asyncio.CancelledError):
+                await pad.run()
+        self.assertEqual(output.getvalue().splitlines(), [
+            "walkingpad: pad unavailable; reconnecting in 5s",
+            "walkingpad: connection lost; reconnecting in 5s",
+            "walkingpad: connection lost; reconnecting in 5s",
+        ])
+        self.assertEqual(pad._idle_wait.await_count, 5)
 
 
 class CommandTests(unittest.IsolatedAsyncioTestCase):
