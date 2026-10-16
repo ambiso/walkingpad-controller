@@ -413,5 +413,67 @@ class CommandTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(finalized["history_revision"], reply["history_revision"] + 1)
 
 
+class AutoStopTests(unittest.IsolatedAsyncioTestCase):
+    def pad(self, *values):
+        pad = make_pad()
+        pad._set(connected=True)
+        pad.read_properties = AsyncMock(side_effect=[
+            [{"id": 2, "value": value}] for value in values])
+        pad.write_property = AsyncMock(return_value=True)
+        return pad
+
+    async def test_query_observed_value(self):
+        pad = self.pad(0x403C)
+        reply = await daemon.dispatch(pad, {"cmd": "auto-stop"})
+        self.assertEqual(reply, {"ok": True, "auto_stop": {
+            "enabled": False, "supports_seconds": True,
+            "custom_seconds": False, "seconds": 60, "raw": 0x403C}})
+        pad.write_property.assert_not_awaited()
+
+    async def test_enable_duration_and_disable_preserve_other_bits(self):
+        for old, value, seconds, target in [
+                (0x403C, "on", 30, 0xE01E),
+                (0xE01E, "off", None, 0x601E),
+                (0x601E, "on", None, 0xE01E)]:
+            with self.subTest(value=value, seconds=seconds):
+                pad = self.pad(old, target)
+                reply = await daemon.dispatch(pad, {
+                    "cmd": "auto-stop", "value": value, "seconds": seconds})
+                self.assertTrue(reply["ok"])
+                pad.write_property.assert_awaited_once_with(2, target)
+
+    async def test_rejected_unsupported_missing_and_ineffective(self):
+        for values, seconds, accepted in [
+                ([0x403C], None, False), ([0x403C, 0x403C], None, True),
+                ([60], 30, True), ([], None, True)]:
+            with self.subTest(values=values, seconds=seconds):
+                pad = self.pad(*values)
+                if not values:
+                    pad.read_properties = AsyncMock(return_value=[])
+                pad.write_property.return_value = accepted
+                reply = await daemon.dispatch(pad, {
+                    "cmd": "auto-stop", "value": "on", "seconds": seconds})
+                self.assertFalse(reply["ok"])
+                self.assertIn("error", reply)
+                if values == [60] or not values:
+                    pad.write_property.assert_not_awaited()
+
+    async def test_unchanged_setting_needs_no_write(self):
+        pad = self.pad(0xE01E)
+        self.assertTrue((await pad.auto_stop("on", 30))["ok"])
+        pad.write_property.assert_not_awaited()
+        self.assertEqual(pad.read_properties.await_count, 1)
+
+    async def test_invalid_socket_requests_never_write(self):
+        for value, seconds in [(None, 30), ("yes", None), ("off", 30), ("on", 0),
+                               ("on", 8192), ("on", True), ("on", 1.5)]:
+            pad = self.pad()
+            reply = await daemon.dispatch(pad, {
+                "cmd": "auto-stop", "value": value, "seconds": seconds})
+            self.assertFalse(reply["ok"])
+            pad.read_properties.assert_not_awaited()
+            pad.write_property.assert_not_awaited()
+
+
 if __name__ == "__main__":
     unittest.main()

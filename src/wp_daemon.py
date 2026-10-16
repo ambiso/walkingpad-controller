@@ -680,6 +680,43 @@ class Pad:
                 return ok, value, new_value
         return False, None, None
 
+    async def read_auto_stop(self):
+        # KS Fit 6.6.0: property 2 is no-load stop, not idle sleep.
+        for record in await self.read_properties():
+            if record["id"] == 2:
+                value = record["value"]
+                return {"enabled": bool(value & 0x8000),
+                        "supports_seconds": bool(value & 0x4000),
+                        "custom_seconds": bool(value & 0x2000),
+                        "seconds": value & 0x1FFF, "raw": value}
+        raise RuntimeError("auto-stop property unavailable")
+
+    async def auto_stop(self, value=None, seconds=None):
+        if value not in (None, "on", "off"):
+            raise ValueError("value must be on or off")
+        if seconds is not None:
+            valid = value == "on" and type(seconds) is int and 1 <= seconds <= 8191
+            if not valid:
+                raise ValueError("seconds requires on and an integer from 1 to 8191")
+        state = await self.read_auto_stop()
+        if value is not None:
+            enabled = value == "on"
+            target = state["raw"] | 0x8000 if enabled else state["raw"] & ~0x8000
+            mask = 0x8000
+            if seconds is not None:
+                if not state["supports_seconds"]:
+                    raise ValueError("pad does not support setting auto-stop duration")
+                target = (target & ~0x1FFF) | 0x2000 | seconds
+                mask |= 0x3FFF
+            if target != state["raw"]:
+                if not await self.write_property(2, target):
+                    raise RuntimeError("auto-stop write rejected")
+                state = await self.read_auto_stop()
+                if (state["raw"] & mask) != (target & mask):
+                    return {"ok": False, "error": "pad did not confirm auto-stop setting",
+                            "auto_stop": state}
+        return {"ok": True, "auto_stop": state}
+
     # -- connection lifecycle -----------------------------------------------
 
     async def connect_once(self):
@@ -819,6 +856,11 @@ async def dispatch(pad, request):
         return {"ok": True, "state": pad.state}
     if cmd == "properties":
         return {"ok": True, "properties": await pad.read_properties()}
+    if cmd == "auto-stop":
+        try:
+            return await pad.auto_stop(request.get("value"), request.get("seconds"))
+        except (ValueError, RuntimeError, asyncio.TimeoutError) as exc:
+            return {"ok": False, "error": str(exc) or "auto-stop request timed out"}
     if cmd == "start":
         try:
             result = await pad.cmd_start(request.get("speed"))

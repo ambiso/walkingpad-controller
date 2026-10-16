@@ -91,6 +91,9 @@ def build_request(args):
         return {"cmd": "watch"}, True
     if args.command == "properties":
         return {"cmd": "properties"}, False
+    if args.command == "auto-stop":
+        return {"cmd": "auto-stop", "value": args.value,
+                "seconds": args.seconds}, False
     if args.command == "start":
         return {"cmd": "start", "speed": args.speed}, False
     if args.command == "speed":
@@ -119,6 +122,10 @@ def build_parser():
     sub.add_parser("status", help="connection state and last telemetry")
     sub.add_parser("watch", help="stream state updates until interrupted")
     sub.add_parser("properties", help="dump vendor property records")
+    p_auto = sub.add_parser("auto-stop", help="query or configure no-load stop (not idle sleep)")
+    p_auto.add_argument("value", nargs="?", choices=["on", "off"])
+    p_auto.add_argument("seconds", nargs="?", type=int,
+                        help="custom timeout, 1–8191 seconds (only with on)")
     p_start = sub.add_parser("start", help="start the belt")
     p_start.add_argument("--speed", type=float, help="target speed in km/h")
     p_speed = sub.add_parser("speed", help="set speed (starts belt if stopped)")
