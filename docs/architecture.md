@@ -12,6 +12,49 @@ than opening their own BLE links. Silent property reads check the connection
 while disconnected is queued and wakes the reconnect loop. The `reconnect`
 command forces a fresh link.
 
+## Command scheduling
+
+A single priority queue owns vendor and FTMS control exchanges.
+Each exchange includes its response, with at least 400 ms between writes. This
+is a conservative scheduling choice; hardware has not established that spacing
+is required across the two channels. Stop is selected before any ordinary
+queued exchange, including work waiting for pacing. A request already sent is
+drained or times out before another exchange begins.
+
+Stop immediately invalidates unfinished Start sequences and queued speed
+changes. Pause and newer Start requests also invalidate older movement work;
+only the latest unsent speed target is written. Start's wake, countdown wait,
+and optional speed adjustment do not hold the exchange queue. Each continuation
+checks its movement generation before issuing further work. If Stop is requested
+while disconnected, it remains queued and is attempted before a subsequent
+queued Start on reconnection.
+
+Start has an eight-second deadline from the request until the pad reports that
+it has started. Expiry cancels the pending Start and clears `starting`; it does
+not leave a request that could execute when the pad is powered on later. If the
+link is still connected, expiry also queues Stop to cancel a potentially
+accepted countdown. Ordinary background reconnection continues. A successful
+Start without an explicit target speed leaves the pad's startup speed alone.
+
+Notification waiters are installed immediately before writing, after pacing.
+Vendor responses are matched by reply type, and FTMS responses by request
+opcode; unsolicited property-change events cannot satisfy property reads.
+Because neither response carries a transaction identifier, a timeout invalidates
+the connection before any subsequent request can reuse it. Queued exchanges and
+notification callbacks from older connection generations are discarded.
+
+The extension takes device state only from the watch socket. Command replies
+report results but cannot overwrite newer telemetry received on that stream.
+Replies to older toggle actions cannot cancel a newer countdown. Stop/pause
+notifications update observed belt state but do not invalidate newer user
+requests; an explicit Stop or Pause request cancels pending movement work.
+
+These scheduling interleavings are covered by mocked regression tests; they
+have not yet been exercised on the physical pad. The successful auto-stop
+exchange is separately documented in [pad settings](pad-settings.md).
+
+## Bluetooth access
+
 The daemon also asks BlueZ to drop stale connections before discovery, since a
 stale link can prevent the pad from advertising. Connection beeps can recur when
 reconnecting; keeping the daemon running avoids opening a new connection for

@@ -30,6 +30,7 @@ anativ/R1-Walkingpad-Controller, duttke.de Web Bluetooth implementation.
 
 import argparse
 import asyncio
+from contextvars import ContextVar
 import json
 import os
 import sys
@@ -59,20 +60,68 @@ RESULT_TEXT = {
     5: "control not permitted",
 }
 
-WRITE_PACE = 0.4  # documented spacing within each command channel
+WRITE_PACE = 0.4  # minimum spacing between BLE exchanges
+START_TIMEOUT = 8.0  # from the request until movement is confirmed
+
+
+class PropertyWriteError(RuntimeError):
+    """The pad answered a property write without confirming success."""
 
 
 class ReconnectRequested(Exception):
     """Raised to drop the current link and reconnect without delay."""
 
 
-def _queue_start(pad, request):
-    # A start pressed while the pad is unreachable (standby dropped the
-    # link, or bluetoothd holds a stale one) should not be lost: queue
-    # it, flag the state stream so clients show "starting…" through the
-    # reconnect window, and wake the reconnect loop immediately.
-    pad.pending_start = {"speed": request.get("speed")}
-    pad.mark_starting()
+class Superseded(RuntimeError):
+    """A newer movement request cancelled this work."""
+
+
+class ExchangeQueue:
+    """Serialize short BLE exchanges; Stop precedes ordinary queued work."""
+
+    def __init__(self, pace):
+        self.pace = pace
+        self.queue = asyncio.PriorityQueue()
+        self.sequence = 0
+        self.worker = None
+
+    async def submit(self, operation, priority):
+        future = asyncio.get_running_loop().create_future()
+        self.sequence += 1
+        self.queue.put_nowait((priority, self.sequence, operation, future))
+        if self.worker is None:
+            self.worker = asyncio.create_task(self.run())
+        return await future
+
+    async def run(self):
+        try:
+            while not self.queue.empty():
+                # Choose after pacing, so Stop can overtake work that has
+                # not yet been sent. An exchange on the wire is drained.
+                await self.pace()
+                _priority, _sequence, operation, future = self.queue.get_nowait()
+                if future.cancelled():
+                    continue
+                try:
+                    result = await operation()
+                except asyncio.CancelledError:
+                    future.cancel()
+                    raise
+                except Exception as exc:
+                    if not future.done():
+                        future.set_exception(exc)
+                else:
+                    if not future.done():
+                        future.set_result(result)
+        finally:
+            self.worker = None
+
+
+def _queue_start(pad, request, epoch=None):
+    epoch = pad.begin_start() if epoch is None else epoch
+    if epoch != pad.motion_epoch:
+        raise Superseded("start cancelled")
+    pad.pending_start = {"speed": request.get("speed"), "epoch": epoch}
     pad.reconnect_now.set()
 
 
@@ -356,9 +405,16 @@ class Pad:
         self.pending_start = None
         self.starting_task = None
         self.client = None
-        self.vendor_lock = asyncio.Lock()
+        self.exchanges = ExchangeQueue(lambda: self._paced())
+        # Each movement sequence carries a guard through its nested BLE
+        # calls. The queue captures it; worker-task context is never relied on.
+        self.intent = ContextVar("walkingpad_intent", default=None)
+        self.motion_epoch = 0
+        self.speed_revision = 0
+        self.link_epoch = 0
+        self.link_broken = False
+        self.pending_stop = False
         self.vendor_reply = None
-        self.cp_lock = asyncio.Lock()
         self.cp_reply = {}
         self.last_write = 0.0
         self.watchers = set()
@@ -389,7 +445,6 @@ class Pad:
         wait = self.last_write + WRITE_PACE - time.monotonic()
         if wait > 0:
             await asyncio.sleep(wait)
-        self.last_write = time.monotonic()
 
     async def _wait(self, predicate, timeout):
         deadline = time.monotonic() + timeout
@@ -403,9 +458,10 @@ class Pad:
 
     def on_vendor(self, _char, data):
         frame = bytes(data)
-        future = self.vendor_reply
-        if future is not None and not future.done():
-            future.set_result(frame)
+        if self.vendor_reply is not None:
+            expected, future = self.vendor_reply
+            if frame[:2] == expected and not future.done():
+                future.set_result(frame)
 
     def on_cp(self, _char, data):
         # FTMS response indication: [0x80, request-op, result, params...]
@@ -419,6 +475,8 @@ class Pad:
         frame = bytes(data)
         if not frame:
             return
+        # A stop/pause report can belong to an earlier command. It updates
+        # observed state, but must not cancel a newer requested Start.
         op = frame[0]
         if op == 0x04:
             self.sessions.start()
@@ -428,14 +486,14 @@ class Pad:
                 self.sessions.reset()
             else:
                 self.sessions.finish()
-            self._set(belt="stopped", speed=0.0, starting=False,
+            self._set(belt="stopped", speed=0.0,
                       **self.sessions.live())
         elif frame[:2] == b"\x02\x02":
-            self._set(belt="paused", speed=0.0, starting=False)
+            self._set(belt="paused", speed=0.0)
         elif op == 0x02:
             # A missing/unknown parameter cannot distinguish stop from pause.
             # Preserve accounting until telemetry demonstrates a reset.
-            self._set(belt="stopped", speed=0.0, starting=False)
+            self._set(belt="stopped", speed=0.0)
         elif op == 0xFF:
             self._set(control=False)
 
@@ -451,42 +509,68 @@ class Pad:
 
     # -- vendor channel ---------------------------------------------------
 
-    async def vendor_request(self, frame, expect=None, timeout=3.0):
-        # One vendor exchange in flight at a time; the reply arrives on the
-        # supplement notify characteristic subscribed at connect time.
-        async with self.vendor_lock:
-            future = None
-            if expect is not None:
-                future = asyncio.get_running_loop().create_future()
-                self.vendor_reply = future
+    def check_intent(self):
+        guard = self.intent.get()
+        if guard is not None and not guard():
+            raise Superseded("movement request superseded")
+
+    def break_link(self, wake=True):
+        # Replies have no transaction IDs. After a timeout, no new exchange
+        # may reuse this connection and mistake a late reply for its own.
+        self.link_epoch += 1
+        self.link_broken = True
+        self._set(connected=False, unlocked=False, control=False, belt="unknown")
+        pending = list(self.cp_reply.values())
+        if self.vendor_reply is not None:
+            pending.append(self.vendor_reply[1])
+        for future in pending:
+            if not future.done():
+                future.set_exception(ConnectionError("Bluetooth connection changed"))
+        if wake:
+            self.reconnect_now.set()
+
+    async def exchange(self, characteristic, frame, expected, timeout, priority=10):
+        client, generation = self.client, self.link_epoch
+        guard = self.intent.get()
+
+        def check():
+            if guard is not None and not guard():
+                raise Superseded("movement request superseded")
+            if self.link_broken or self.client is not client or self.link_epoch != generation:
+                raise ConnectionError("Bluetooth connection changed")
+
+        async def perform():
+            check()
+            future = asyncio.get_running_loop().create_future()
+            if characteristic == FTMS_CP:
+                self.cp_reply[expected] = future
+            else:
+                self.vendor_reply = (bytes(expected), future)
             try:
-                await self._paced()
-                await self.client.write_gatt_char(KS_WRITE, frame, response=False)
-                if future is None:
-                    return None
-                reply = await asyncio.wait_for(future, timeout)
-                if reply[0:2] != bytes(expect):
-                    raise RuntimeError(
-                        "vendor reply %s != expected %s"
-                        % (reply.hex(), bytes(expect).hex()))
-                return reply
+                async with asyncio.timeout(timeout):
+                    self.last_write = time.monotonic()
+                    await client.write_gatt_char(
+                        characteristic, frame, response=characteristic == FTMS_CP)
+                    return await future
+            except Exception:
+                if self.client is client and self.link_epoch == generation:
+                    self.break_link()
+                raise
             finally:
-                self.vendor_reply = None
+                if characteristic == FTMS_CP:
+                    self.cp_reply.pop(expected, None)
+                else:
+                    self.vendor_reply = None
+
+        return await self.exchanges.submit(perform, priority)
+
+    async def vendor_request(self, frame, expect, timeout=3.0):
+        return await self.exchange(KS_WRITE, frame, expect, timeout)
 
     async def unlock(self, name):
-        # The unlock write is fire-and-forget; success arrives as the 71 80
-        # notification. The macOS client re-sends once at 5 s inside a 10 s
-        # window, so this does the same.
-        frame = unlock_frame(name)
-        for attempt in range(2):
-            try:
-                await self.vendor_request(frame, expect=b"\x71\x80", timeout=10.0)
-                return True
-            except (asyncio.TimeoutError, RuntimeError) as exc:
-                if attempt:
-                    raise RuntimeError("vendor unlock rejected: %s" % exc) from exc
-                await asyncio.sleep(5.0)
-        return False
+        # A missing reply requires a fresh connection, not an ambiguous retry.
+        await self.vendor_request(unlock_frame(name), expect=b"\x71\x80", timeout=10.0)
+        return True
 
     async def read_properties(self):
         # SETTING_GET (all): 72 00 01 00 -> 72 80, data = 4-byte records
@@ -505,46 +589,38 @@ class Pad:
         return records
 
     async def write_property(self, prop_id, value):
-        # SETTING_SET: 72 01 03 <id> <lo> <hi> -> 72 81; data[1] == 0 means OK.
+        # SETTING_SET: 72 01 03 <id> <lo> <hi> -> 72 81 <len> <id> <error>.
         frame = ks_frame(0x72, 0x01, [prop_id, value & 0xFF, (value >> 8) & 0xFF])
         reply = await self.vendor_request(frame, expect=b"\x72\x81", timeout=3.0)
         data = reply[3:3 + reply[2]] if reply is not None else b""
-        return len(data) >= 2 and data[1] == 0
+        if len(data) != 2 or data[0] != prop_id:
+            raise PropertyWriteError("unexpected property %d write reply: %s"
+                                     % (prop_id, reply.hex() if reply is not None else "none"))
+        if data[1]:
+            raise PropertyWriteError("property %d write rejected: error %d, reply %s"
+                                     % (prop_id, data[1], reply.hex()))
+        return True
 
     # -- FTMS control point ----------------------------------------------
 
-    async def _cp_once(self, op, data=b"", timeout=3.0):
-        future = asyncio.get_running_loop().create_future()
-        self.cp_reply[op] = future
-        try:
-            await self._paced()
-            await self.client.write_gatt_char(
-                FTMS_CP, bytes([op]) + bytes(data), response=True)
-            return await asyncio.wait_for(future, timeout)
-        finally:
-            self.cp_reply.pop(op, None)
+    async def _cp_once(self, op, data=b"", timeout=3.0, priority=10):
+        return await self.exchange(FTMS_CP, bytes([op]) + bytes(data), op, timeout, priority)
 
-    async def cp(self, op, data=b"", timeout=3.0):
-        # Serialized control-point exchange with the documented recovery for
-        # result 5 "control not permitted": re-claim control, retry once.
-        async with self.cp_lock:
-            result = await self._cp_once(op, data, timeout)
-            if result == 5:
-                await self._cp_once(OP_REQUEST_CONTROL, timeout=timeout)
-                result = await self._cp_once(op, data, timeout)
-            return result
+    async def cp(self, op, data=b"", timeout=3.0, priority=10):
+        result = await self._cp_once(op, data, timeout, priority)
+        if result == 5:
+            await self._cp_once(OP_REQUEST_CONTROL, timeout=timeout, priority=priority)
+            result = await self._cp_once(op, data, timeout, priority)
+        return result
 
     async def request_control(self):
         # REQUEST_CONTROL is required once before any command. Without the
         # vendor unlock the pad ignores it — the exact failure the library
         # CLI shows. Post-unlock it is granted within a few attempts.
         for _ in range(3):
-            try:
-                if await self.cp(OP_REQUEST_CONTROL) == 1:
-                    self._set(control=True)
-                    return True
-            except asyncio.TimeoutError:
-                pass
+            if await self.cp(OP_REQUEST_CONTROL) == 1:
+                self._set(control=True)
+                return True
             await asyncio.sleep(1.0)
         return False
 
@@ -569,32 +645,46 @@ class Pad:
                     for item in await self.read_properties())
         return True
 
-    async def cmd_start(self, speed=None):
-        # Start on a moving belt is refused (result 4) — if it is already
-        # running, just retarget the speed.
-        if self.state["belt"] == "started":
-            return await self.cmd_speed(speed) if speed else 1
-        if not await self.wake_for_start():
-            print("walkingpad: wake refused; not sending Start", file=sys.stderr)
-            return 4
-        result = await self.cp(OP_START)
-        if result == 1:
-            self.sessions.start()
-            # Accepted: the pad now counts down ~3 s before the belt moves.
-            # Surface that window so clients don't look dead; the flag
-            # clears on the machine-status "started" frame (or any belt
-            # change) and, if that frame is missed, via the watchdog.
-            if self.state["belt"] != "started":
-                self.mark_starting()
-            if speed:
-                # The pad ramps to minimum speed first; retargeting too
-                # early is unreliable, so wait for telemetry to report
-                # speed > 0 plus a stabilization period, like the library
-                # does.
-                await self._wait(lambda: self.state["speed"] > 0, 5.0)
-                await asyncio.sleep(1.0)
-                result = await self.cmd_speed(speed)
-        return result
+    def cancel_pending_motion(self):
+        self.motion_epoch += 1
+        self.speed_revision += 1
+        self.pending_start = None
+        if self.starting_task is not None:
+            self.starting_task.cancel()
+        self._set(starting=False)
+
+    def begin_start(self):
+        self.cancel_pending_motion()
+        if self.state["belt"] != "started":
+            self.mark_starting()
+        return self.motion_epoch
+
+    async def cmd_start(self, speed=None, epoch=None):
+        epoch = self.begin_start() if epoch is None else epoch
+        generation, speed_revision = self.link_epoch, self.speed_revision
+        token = self.intent.set(lambda: self.motion_epoch == epoch and self.link_epoch == generation)
+        try:
+            self.check_intent()
+            if self.state["belt"] == "started":
+                return await self.cmd_speed(speed) if speed is not None else 1
+            if not await self.wake_for_start():
+                return 4
+            self.check_intent()
+            result = await self.cp(OP_START)
+            self.check_intent()
+            if result == 1:
+                self.sessions.start()
+                if speed is not None:
+                    moving = await self._wait(lambda: self.state["speed"] > 0, 5.0)
+                    self.check_intent()
+                    if moving:
+                        await asyncio.sleep(1.0)
+                        self.check_intent()
+                        if self.speed_revision == speed_revision:
+                            result = await self.cmd_speed(speed)
+            return result
+        finally:
+            self.intent.reset(token)
 
     async def _idle_wait(self, timeout):
         # Returns True when a reconnect was requested (the caller drops
@@ -607,32 +697,43 @@ class Pad:
         self.reconnect_now.clear()
         return True
 
-    def _run_queued_start(self):
-        # Runs after "pad ready": a start that was queued while the pad
-        # was unreachable finally has a live link.
-        if self.pending_start is None:
+    def _resume_commands(self):
+        if not self.pending_stop and self.pending_start is None:
             return
-        queued = self.pending_start
-        self.pending_start = None
 
-        async def run():
+        async def resume():
             try:
-                result = await self.cmd_start(queued["speed"])
-                if result != 1:
-                    print("walkingpad: queued start refused (result %s)"
-                          % result, file=sys.stderr)
+                if self.pending_stop and await self._stop() != 1:
+                    return
+                queued = self.pending_start
+                self.pending_start = None
+                if queued is not None:
+                    result = await self.cmd_start(queued["speed"], queued["epoch"])
+                    if result != 1 and queued["epoch"] == self.motion_epoch:
+                        self.cancel_pending_motion()
+            except Superseded:
+                pass
             except Exception as exc:
-                print("walkingpad: queued start failed: %s" % exc,
-                      file=sys.stderr)
+                print("walkingpad: queued command failed: %s" % exc, file=sys.stderr)
 
-        asyncio.get_running_loop().create_task(run())
+        asyncio.create_task(resume())
 
     async def _starting_watchdog(self):
-        # 30 s covers a full reconnect (scan timeout 10 s + retry) plus
-        # the pad's ~3 s countdown. New starts replace this watchdog.
-        await asyncio.sleep(30.0)
-        if self.state.get("starting") and self.state["belt"] != "started":
-            self._set(starting=False)
+        await asyncio.sleep(START_TIMEOUT)
+        if self.state["starting"]:
+            self.starting_task = None
+            self.cancel_pending_motion()
+            # Start may already have been accepted. Cancel its countdown
+            # too, rather than only hiding an unconfirmed operation.
+            if self.state["connected"]:
+                self.pending_stop = True
+                token = self.intent.set(None)
+                try:
+                    await self._stop()
+                except Exception as exc:
+                    print("walkingpad: stop after start timeout failed: %s" % exc, file=sys.stderr)
+                finally:
+                    self.intent.reset(token)
 
     def mark_starting(self):
         if self.starting_task is not None:
@@ -641,30 +742,48 @@ class Pad:
         self.starting_task = asyncio.create_task(self._starting_watchdog())
 
     async def cmd_speed(self, speed):
-        # Belt refuses speed writes while stopped; clamp to the reported
-        # range (fallback 1.0-6.0 km/h, observed on a KS-HD-Z1E).
         lo = self.state["min_speed"] or 1.0
         hi = self.state["max_speed"] or 6.0
         target = min(max(float(speed), lo), hi)
-        return await self.cp(
-            OP_SET_SPEED, int(round(target * 100)).to_bytes(2, "little"))
+        self.speed_revision += 1
+        epoch, revision = self.motion_epoch, self.speed_revision
+        generation = self.link_epoch
+        token = self.intent.set(lambda: (epoch, revision, generation) == (
+            self.motion_epoch, self.speed_revision, self.link_epoch))
+        try:
+            return await self.cp(OP_SET_SPEED, int(round(target * 100)).to_bytes(2, "little"))
+        finally:
+            self.intent.reset(token)
 
-    async def cmd_stop(self):
-        # Stop (08 01) finalizes the pad's session and resets its counters;
-        # pause (08 02) keeps the session open.
-        result = await self.cp(OP_STOP_PAUSE, b"\x01")
+    async def _stop(self):
+        epoch = self.motion_epoch
+        result = await self.cp(OP_STOP_PAUSE, b"\x01", priority=0)
         if result == 1:
-            # Also handles firmware that omits the status notification.
+            self.pending_stop = False
             self.sessions.finish()
-            self._set(belt="stopped", speed=0.0, starting=False,
+            newer_start = self.pending_start is not None or epoch != self.motion_epoch
+            self._set(belt="stopped", speed=0.0,
+                      starting=self.state["starting"] if newer_start else False,
                       **self.sessions.live())
         return result
 
+    async def cmd_stop(self):
+        self.cancel_pending_motion()
+        self.pending_stop = True
+        return await self._stop()
+
     async def cmd_pause(self):
-        result = await self.cp(OP_STOP_PAUSE, b"\x02")
-        if result == 1:
-            self._set(belt="paused", speed=0.0, starting=False)
-        return result
+        self.cancel_pending_motion()
+        epoch, generation = self.motion_epoch, self.link_epoch
+        token = self.intent.set(lambda: (epoch, generation) == (
+            self.motion_epoch, self.link_epoch))
+        try:
+            result = await self.cp(OP_STOP_PAUSE, b"\x02", priority=1)
+            if result == 1 and epoch == self.motion_epoch:
+                self._set(belt="paused", speed=0.0, starting=False)
+            return result
+        finally:
+            self.intent.reset(token)
 
     async def cmd_set_buzzer(self, enabled):
         # Property 8 "switches": bit 1 = buzzer, bit 3 = interaction light.
@@ -737,15 +856,25 @@ class Pad:
         await client.connect()
         self._set(device={"address": device.address, "name": name})
         self.client = client
+        self.link_epoch += 1
+        self.link_broken = False
+        generation = self.link_epoch
         self._set(connected=True)
         print("walkingpad: connected to %s (%s)" % (device.name, device.address),
               file=sys.stderr)
         # Subscribe BEFORE any vendor write — the unlock reply arrives on the
         # supplement notify characteristic.
-        await client.start_notify(KS_NOTIFY, self.on_vendor)
-        await client.start_notify(FTMS_CP, self.on_cp)
-        await client.start_notify(FTMS_DATA, self.on_data)
-        await client.start_notify(FTMS_STATUS, self.on_status)
+
+        def current(handler):
+            def notify(char, data):
+                if self.client is client and self.link_epoch == generation:
+                    handler(char, data)
+            return notify
+
+        await client.start_notify(KS_NOTIFY, current(self.on_vendor))
+        await client.start_notify(FTMS_CP, current(self.on_cp))
+        await client.start_notify(FTMS_DATA, current(self.on_data))
+        await client.start_notify(FTMS_STATUS, current(self.on_status))
         if not await self.unlock(device.name):
             raise RuntimeError("vendor unlock rejected (no 71 80 reply)")
         self._set(unlocked=True)
@@ -767,7 +896,11 @@ class Pad:
             print("walkingpad: WARNING control not granted yet; commands may "
                   "be refused until it is", file=sys.stderr)
         print("walkingpad: pad ready", file=sys.stderr)
-        self._run_queued_start()
+        if self.pending_start is not None:
+            # A Start queued during discovery requested this connection;
+            # its wake-up event must not immediately tear it down again.
+            self.reconnect_now.clear()
+        self._resume_commands()
         # Keepalive: a silent property read every keepalive seconds surfaces
         # dead links quickly (the write raises once bluetoothd notices) and
         # keeps idle connections from being dropped. A reconnect request
@@ -777,7 +910,7 @@ class Pad:
                 if await self._idle_wait(self.keepalive):
                     raise ReconnectRequested()
                 await self.vendor_request(
-                    ks_frame(0x72, 0x00, [0x00]), expect=b"\x72\x80", timeout=10.0)
+                    ks_frame(0x72, 0x00, [0x00]), expect=b"\x72\x80")
             else:
                 if await self._idle_wait(3600.0):
                     raise ReconnectRequested()
@@ -801,6 +934,7 @@ class Pad:
                           file=sys.stderr)
                 last_error = None if immediate else error
                 if self.client is not None:
+                    self.break_link(wake=False)
                     try:
                         await self.client.disconnect()
                     except Exception as exc:
@@ -839,13 +973,15 @@ async def dispatch(pad, request):
         # Drop the current link (if any) and reconnect without delay —
         # e.g. when the pad went into standby and the client knows it
         # needs a fresh link now rather than at the next keepalive.
-        pad.reconnect_now.set()
+        pad.cancel_pending_motion()
+        pad.break_link()
         return {"ok": True, "state": pad.state}
     if not pad.state["connected"]:
-        if cmd == "stop" and pad.pending_start is not None:
-            pad.pending_start = None
-            pad._set(starting=False)
-            return {"ok": True, "state": pad.state}
+        if cmd == "stop":
+            pad.cancel_pending_motion()
+            pad.pending_stop = True
+            pad.reconnect_now.set()
+            return {"ok": True, "queued": "stop", "state": pad.state}
         if cmd == "start":
             # Queue the start across the reconnect; the state stream
             # reports starting=true throughout the reconnect window.
@@ -862,13 +998,22 @@ async def dispatch(pad, request):
         except (ValueError, RuntimeError, asyncio.TimeoutError) as exc:
             return {"ok": False, "error": str(exc) or "auto-stop request timed out"}
     if cmd == "start":
+        epoch = pad.begin_start()
         try:
-            result = await pad.cmd_start(request.get("speed"))
+            result = await pad.cmd_start(request.get("speed"), epoch)
+            if result != 1 and epoch == pad.motion_epoch:
+                pad.cancel_pending_motion()
+        except (PropertyWriteError, Superseded) as exc:
+            if epoch == pad.motion_epoch:
+                pad.cancel_pending_motion()
+            return {"ok": False, "error": str(exc)}
         except Exception:
             # The link died mid-command (the pad's standby can drop it
             # silently): re-queue the start and reconnect now instead
             # of losing the press.
-            _queue_start(pad, request)
+            if epoch != pad.motion_epoch:
+                return {"ok": False, "error": "start cancelled"}
+            _queue_start(pad, request, epoch)
             return {"ok": True, "queued": "start", "state": pad.state}
     elif cmd == "speed":
         try:
@@ -903,7 +1048,10 @@ async def handle_client(reader, writer, pad):
                     {"ok": False, "error": "invalid JSON"}) + "\n").encode())
                 await writer.drain()
                 continue
-            reply = await dispatch(pad, request)
+            try:
+                reply = await dispatch(pad, request)
+            except Exception as exc:
+                reply = {"ok": False, "error": str(exc) or type(exc).__name__}
             writer.write((json.dumps(reply) + "\n").encode())
             await writer.drain()
             if request.get("cmd") == "watch":

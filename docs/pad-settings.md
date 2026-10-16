@@ -41,9 +41,15 @@ address `0x1ccd4b4`) decodes:
 write as `0xE000 + seconds`. The app's settings dialog is explicitly labelled
 “No-load stop” (`SettingNoloadView`), reached through `setupAutoStopPreference`.
 The daemon uses the same encoding when enabling a custom duration, and preserves
-unrelated fields when toggling the enable flag. These paths have mocked tests;
-auto-stop writes and actual no-load stopping have not been verified on the
-KS-HD-Z1E in this investigation.
+unrelated fields when toggling the enable flag.
+
+A user-supplied KS-HD-Z1E Bluetooth capture confirms that writing `0xe01e`
+(enabled, custom timeout 30 seconds) received `72 81 02 02 00 f7`: property 2,
+error 0. The pad then emitted a `72 50` property-change notification and returned
+`0xe01e` in subsequent property reads. This verifies acceptance and read-back;
+actual no-load stopping has not been verified. The captured exchange is also
+replayed in a regression test, with unsolicited change events interleaved to
+ensure they cannot satisfy pending property reads or writes.
 
 The property value previously read from the user's KS-HD-Z1E was `0x403c`:
 auto-stop disabled, duration setting supported, custom duration disabled,

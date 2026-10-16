@@ -9,7 +9,7 @@ import json
 from pathlib import Path
 import tempfile
 import unittest
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, patch
 
 
 spec = importlib.util.spec_from_file_location(
@@ -373,7 +373,7 @@ class CommandTests(unittest.IsolatedAsyncioTestCase):
         pad = make_pad()
         telemetry(pad)
 
-        async def stop(*_args):
+        async def stop(*_args, **_kwargs):
             pad.on_status(None, b"\x02\x01")
             return 1
 
@@ -413,7 +413,291 @@ class CommandTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(finalized["history_revision"], reply["history_revision"] + 1)
 
 
+class SchedulerTests(unittest.IsolatedAsyncioTestCase):
+    def wire_pad(self):
+        pad = make_pad()
+        pad._set(connected=True)
+        pad.client = AsyncMock()
+        pad._paced = AsyncMock()
+        return pad
+
+    async def test_stop_overtakes_unsent_work_even_during_pacing(self):
+        pad = self.wire_pad()
+        pacing, release = asyncio.Event(), asyncio.Event()
+        sent = []
+
+        async def pace():
+            pacing.set()
+            await release.wait()
+
+        async def write(char, frame, **kwargs):
+            sent.append(frame[0])
+            pad.on_cp(None, bytes([0x80, frame[0], 1]))
+
+        pad._paced = pace
+        pad.client.write_gatt_char.side_effect = write
+        normal = asyncio.create_task(pad.cp(daemon.OP_REQUEST_CONTROL))
+        await pacing.wait()
+        stop = asyncio.create_task(pad.cmd_stop())
+        await asyncio.sleep(0)
+        release.set()
+        await asyncio.gather(normal, stop)
+        self.assertEqual(sent, [daemon.OP_STOP_PAUSE, daemon.OP_REQUEST_CONTROL])
+
+    async def test_stop_drains_active_exchange_then_discards_queued_speed(self):
+        pad = self.wire_pad()
+        active, release = asyncio.Event(), asyncio.Event()
+        sent = []
+
+        async def write(char, frame, **kwargs):
+            sent.append(frame[0])
+            if len(sent) == 1:
+                active.set()
+                await release.wait()
+            pad.on_cp(None, bytes([0x80, frame[0], 1]))
+
+        pad.client.write_gatt_char.side_effect = write
+        first = asyncio.create_task(pad.cmd_speed(2))
+        await active.wait()
+        queued = asyncio.create_task(pad.cmd_speed(4))
+        await asyncio.sleep(0)
+        stop = asyncio.create_task(pad.cmd_stop())
+        await asyncio.sleep(0)
+        release.set()
+        results = await asyncio.gather(first, queued, stop, return_exceptions=True)
+        self.assertEqual(sent, [daemon.OP_SET_SPEED, daemon.OP_STOP_PAUSE])
+        self.assertIsInstance(results[1], daemon.Superseded)
+
+    async def test_only_latest_queued_speed_is_written(self):
+        pad = self.wire_pad()
+        pacing, release = asyncio.Event(), asyncio.Event()
+        speeds = []
+
+        async def pace():
+            pacing.set()
+            await release.wait()
+
+        async def write(char, frame, **kwargs):
+            speeds.append(int.from_bytes(frame[1:], "little"))
+            pad.on_cp(None, bytes([0x80, frame[0], 1]))
+
+        pad._paced = pace
+        pad.client.write_gatt_char.side_effect = write
+        old = asyncio.create_task(pad.cmd_speed(2))
+        await pacing.wait()
+        latest = asyncio.create_task(pad.cmd_speed(4))
+        await asyncio.sleep(0)
+        release.set()
+        results = await asyncio.gather(old, latest, return_exceptions=True)
+        self.assertIsInstance(results[0], daemon.Superseded)
+        self.assertEqual(speeds, [400])
+
+    async def test_stop_cancels_start_while_waking(self):
+        pad = self.wire_pad()
+        waking, release = asyncio.Event(), asyncio.Event()
+
+        async def wake():
+            waking.set()
+            await release.wait()
+            return True
+
+        pad.wake_for_start = wake
+        pad.cp = AsyncMock(return_value=1)
+        start = asyncio.create_task(pad.cmd_start())
+        await waking.wait()
+        await pad.cmd_stop()
+        release.set()
+        with self.assertRaises(daemon.Superseded):
+            await start
+        pad.cp.assert_awaited_once_with(daemon.OP_STOP_PAUSE, b"\x01", priority=0)
+        self.assertFalse(pad.state["starting"])
+
+    async def test_stop_cancels_delayed_start_speed(self):
+        pad = self.wire_pad()
+        waiting, release = asyncio.Event(), asyncio.Event()
+
+        async def moving(*args):
+            waiting.set()
+            await release.wait()
+            return True
+
+        pad.wake_for_start = AsyncMock(return_value=True)
+        pad._wait = moving
+        pad.cp = AsyncMock(return_value=1)
+        pad.cmd_speed = AsyncMock(return_value=1)
+        start = asyncio.create_task(pad.cmd_start(4))
+        await waiting.wait()
+        await pad.cmd_stop()
+        release.set()
+        with self.assertRaises(daemon.Superseded):
+            await start
+        pad.cmd_speed.assert_not_awaited()
+
+    async def test_failed_old_start_cannot_requeue_after_stop(self):
+        pad = self.wire_pad()
+        waiting, release = asyncio.Event(), asyncio.Event()
+
+        async def start(*args):
+            waiting.set()
+            await release.wait()
+            raise ConnectionError("link lost")
+
+        pad.cmd_start = start
+        pad.cmd_stop = AsyncMock(side_effect=pad.cancel_pending_motion)
+        request = asyncio.create_task(daemon.dispatch(pad, {"cmd": "start"}))
+        await waiting.wait()
+        await daemon.dispatch(pad, {"cmd": "stop"})
+        release.set()
+        self.assertFalse((await request)["ok"])
+        self.assertIsNone(pad.pending_start)
+
+    async def test_offline_deadline_cancels_start_instead_of_hiding_it(self):
+        pad = make_pad()
+        with patch.object(daemon, "START_TIMEOUT", 0.01):
+            await daemon.dispatch(pad, {"cmd": "start"})
+            await asyncio.sleep(0.03)
+        self.assertFalse(pad.state["starting"])
+        self.assertIsNone(pad.pending_start)
+        pad.cmd_start = AsyncMock()
+        pad._resume_commands()
+        await asyncio.sleep(0)
+        pad.cmd_start.assert_not_awaited()
+
+    async def test_unconfirmed_accepted_start_is_stopped_at_deadline(self):
+        pad = self.wire_pad()
+        pad.wake_for_start = AsyncMock(return_value=True)
+        pad.cp = AsyncMock(return_value=1)
+        with patch.object(daemon, "START_TIMEOUT", 0.01):
+            self.assertEqual(await pad.cmd_start(), 1)
+            await asyncio.sleep(0.03)
+        self.assertFalse(pad.state["starting"])
+        self.assertEqual([call.args[0] for call in pad.cp.await_args_list],
+                         [daemon.OP_START, daemon.OP_STOP_PAUSE])
+
+    async def test_offline_stop_is_sent_before_a_later_start(self):
+        pad = make_pad()
+        await daemon.dispatch(pad, {"cmd": "stop"})
+        await daemon.dispatch(pad, {"cmd": "start"})
+        epoch = pad.motion_epoch
+        pad._set(connected=True)
+        async def stop(*args, **kwargs):
+            pad.on_status(None, b"\x02\x01")
+            return 1
+
+        pad.cp = AsyncMock(side_effect=stop)
+        pad.cmd_start = AsyncMock(return_value=1)
+        pad._resume_commands()
+        await asyncio.sleep(0)
+        pad.cp.assert_awaited_once_with(daemon.OP_STOP_PAUSE, b"\x01", priority=0)
+        pad.cmd_start.assert_awaited_once_with(None, epoch)
+        self.assertTrue(pad.state["starting"])
+        self.assertFalse(pad.pending_stop)
+        pad.starting_task.cancel()
+
+    async def test_old_exchange_failure_cannot_break_replacement_connection(self):
+        pad = self.wire_pad()
+        sent = asyncio.Event()
+        pad.client.write_gatt_char.side_effect = lambda *args, **kwargs: sent.set()
+        old = asyncio.create_task(pad.cp(daemon.OP_REQUEST_CONTROL))
+        await sent.wait()
+        pad.break_link()
+        pad.client = AsyncMock()
+        pad.link_epoch += 1
+        pad.link_broken = False
+        pad._set(connected=True)
+
+        async def write(char, frame, **kwargs):
+            pad.on_cp(None, bytes([0x80, frame[0], 1]))
+
+        pad.client.write_gatt_char.side_effect = write
+        with self.assertRaises(ConnectionError):
+            await old
+        self.assertEqual(await pad.cp(daemon.OP_REQUEST_CONTROL), 1)
+        self.assertTrue(pad.state["connected"])
+
+    async def test_matching_stale_replies_during_pacing_are_ignored(self):
+        pad = self.wire_pad()
+
+        async def pace():
+            pad.on_cp(None, bytes([0x80, daemon.OP_SET_SPEED, 4]))
+            pad.on_vendor(None, daemon.ks_frame(0x72, 0x80, [2, 0, 60, 0x40]))
+
+        async def write(char, frame, **kwargs):
+            if char == daemon.FTMS_CP:
+                pad.on_cp(None, bytes([0x80, frame[0], 1]))
+            else:
+                pad.on_vendor(None, daemon.ks_frame(0x72, 0x80, [2, 0, 30, 0xe0]))
+
+        pad._paced = pace
+        pad.client.write_gatt_char.side_effect = write
+        self.assertEqual(await pad.cp(daemon.OP_SET_SPEED), 1)
+        self.assertEqual(await pad.read_properties(), [{"id": 2, "value": 0xE01E}])
+
+    async def test_timeout_invalidates_connection_and_queued_exchanges(self):
+        pad = self.wire_pad()
+        with self.assertRaises(asyncio.TimeoutError):
+            await pad._cp_once(daemon.OP_SET_SPEED, timeout=0.001)
+        self.assertFalse(pad.state["connected"])
+        with self.assertRaises(ConnectionError):
+            await pad.cp(daemon.OP_SET_SPEED)
+        self.assertEqual(pad.client.write_gatt_char.await_count, 1)
+
+
+
 class AutoStopTests(unittest.IsolatedAsyncioTestCase):
+    async def test_captured_write_and_readback_with_unsolicited_notifications(self):
+        pad = make_pad()
+        pad._set(connected=True)
+        changed = bytes.fromhex("72 50 03 02 1e e0 c5")
+        replies = iter([
+            "72 80 1c 01 00 00 00 04 00 15 00 05 00 00 00 02 "
+            "00 3c 40 08 00 01 00 0a 00 00 02 06 00 00 00 c6",
+            "72 81 02 02 00 f7",
+            "72 80 1c 01 00 00 00 04 00 15 00 05 00 00 00 02 "
+            "00 1e e0 08 00 01 00 0a 00 00 02 06 00 00 00 48",
+        ])
+
+        async def pace():
+            # A change event can arrive after a waiter is installed, before
+            # the paced request is sent. It must not complete that waiter.
+            pad.on_vendor(None, changed)
+
+        async def write(*args, **kwargs):
+            pad.on_vendor(None, bytes.fromhex(next(replies)))
+            pad.on_vendor(None, changed)
+
+        pad._paced = pace
+        pad.client = AsyncMock()
+        pad.client.write_gatt_char.side_effect = write
+        reply = await daemon.dispatch(pad, {
+            "cmd": "auto-stop", "value": "on", "seconds": 30})
+        self.assertTrue(reply["ok"])
+        self.assertEqual(reply["auto_stop"]["raw"], 0xE01E)
+        self.assertEqual(pad.client.write_gatt_char.await_count, 3)
+
+    async def test_wake_write_rejection_does_not_queue_start(self):
+        pad = make_pad()
+        pad._set(connected=True)
+        pad.cmd_start = AsyncMock(side_effect=daemon.PropertyWriteError("rejected"))
+        reply = await daemon.dispatch(pad, {"cmd": "start"})
+        self.assertFalse(reply["ok"])
+        self.assertIsNone(pad.pending_start)
+
+    async def test_wire_write_and_reply_errors(self):
+        pad = make_pad()
+        for data, error in [(b"\x02\x00", None), (b"\x02\x0a", "error 10"),
+                            (b"\x08\x00", "unexpected property"),
+                            (b"\x02", "unexpected property")]:
+            with self.subTest(data=data):
+                pad.vendor_request = AsyncMock(return_value=daemon.ks_frame(0x72, 0x81, data))
+                if error:
+                    with self.assertRaisesRegex(RuntimeError, error):
+                        await pad.write_property(2, 0xE01E)
+                else:
+                    self.assertTrue(await pad.write_property(2, 0xE01E))
+                pad.vendor_request.assert_awaited_once_with(
+                    bytes.fromhex("72 01 03 02 1e e0 76"), expect=b"\x72\x81", timeout=3.0)
+
     def pad(self, *values):
         pad = make_pad()
         pad._set(connected=True)
