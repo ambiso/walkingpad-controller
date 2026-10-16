@@ -81,3 +81,17 @@ These are implemented parser behaviors, covered by mocked tests. In particular,
 the safety-stop test injects a `03` frame; it does not demonstrate that the
 KS-HD-Z1E actually emits one. There is no hardware trace in this repository
 establishing that behavior.
+
+## Starting from standby
+
+Before Start on a stopped belt, the daemon reads vendor property 10. When
+mode bits 5–7 report sleep (2), it writes manual mode (0), preserving all other
+bits, and checks that the pad reports manual mode before sending FTMS Start.
+A refused wake returns failure without sending Start. Already moving belts
+continue to use the existing speed-change path.
+
+Observed on KS-HD-Z1E firmware `J41_V301.10.22`: Start in standby returned
+FTMS result 4; waking with the physical remote changed property 10 from
+`0x0240` to `0x0200`, after which Start worked. The automatic property write
+and refusal paths are covered by mocked tests; the automatic wake sequence
+still needs a hardware test.

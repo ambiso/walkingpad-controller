@@ -281,7 +281,7 @@ def unlock_frame(name):
 
 
 async def find_device(address=None, prefix="KS-", timeout=10.0):
-    # Same discovery logic as wp_cli.py: pin by address if given, else match
+    # Pin discovery by address if given, otherwise match
     # the advertised name prefix (KS-HD-Z1E matches the default "KS-").
     if address:
         return await BleakScanner.find_device_by_address(address, timeout=timeout)
@@ -550,11 +550,33 @@ class Pad:
 
     # -- belt commands ----------------------------------------------------
 
+    async def wake_for_start(self):
+        # Property 10, bits 5–7: manual=0, auto=1, sleep=2.
+        # Z1E J41_V301.10.22 refuses FTMS Start while asleep (result 4).
+        # Remote wake changed 0x0240 to 0x0200 on that hardware; preserve
+        # every bit outside the mode field when requesting manual mode.
+        # https://github.com/slandau3/z1-walkingpad-mcp/blob/main/docs/protocol.md#properties-observed-on-the-z1
+        for record in await self.read_properties():
+            if record["id"] == 10:
+                value = record["value"]
+                if ((value >> 5) & 7) != 2:
+                    return True
+                if not await self.write_property(10, value & ~0xE0):
+                    return False
+                # Check that waking succeeded before attempting to move.
+                return any(
+                    item["id"] == 10 and ((item["value"] >> 5) & 7) == 0
+                    for item in await self.read_properties())
+        return True
+
     async def cmd_start(self, speed=None):
         # Start on a moving belt is refused (result 4) — if it is already
         # running, just retarget the speed.
         if self.state["belt"] == "started":
             return await self.cmd_speed(speed) if speed else 1
+        if not await self.wake_for_start():
+            print("walkingpad: wake refused; not sending Start", file=sys.stderr)
+            return 4
         result = await self.cp(OP_START)
         if result == 1:
             self.sessions.start()

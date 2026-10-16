@@ -126,7 +126,9 @@ sudo systemctl start walkingpad
 ## Connection problems and history limits
 
 The daemon reconnects automatically when the link drops. If the pad has gone
-into standby, a start request also triggers reconnection. To reconnect manually
+into standby while still connected, Start wakes it before starting the belt.
+If the Bluetooth link has dropped,
+the start request is queued across reconnection instead. To reconnect manually
 or inspect the service:
 
 ```sh
@@ -137,6 +139,9 @@ journalctl -u walkingpad -b
 
 If no pad is found, check that Bluetooth and the pad are on, the configured
 address is correct, and the phone app has released its connection.
+
+All command-line control goes through the daemon with `walkingpad-client`.
+Running `nix run . -- status` from this repository uses the same client.
 
 Keep the service running while you walk for the most reliable history. The pad
 has no session identifier, so stopping and restarting it while the computer is

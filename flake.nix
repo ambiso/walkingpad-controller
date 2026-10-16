@@ -1,52 +1,5 @@
-# flake.nix — Nix flake exposing:
-#   * overlays.default            the "module": a Nixpkgs overlay that registers
-#                                 walkingpad-controller (defined in
-#                                 nix/walkingpad-controller.nix) in every Python package set
-#   * devShells.<system>.default  a dev shell whose pythonEnv contains the package
-#   * packages.<system>.walkingpad-controller
-#                                 the package itself, buildable standalone
-#   * packages.<system>.walkingpad-cli
-#                                 small CLI (scan/info/start/speed/stop) built
-#                                 from the package; source lives in
-#                                 src/wp_cli.py, pulled in via builtins.readFile
-#   * packages.<system>.walkingpad-sandboxed
-#                                 the CLI under bubblewrap, isolated except for
-#                                 the host's D-Bus system bus socket
-#   * packages.<system>.walkingpad-daemon
-#                                 persistent daemon: holds the pad's single BLE
-#                                 link, performs the KingSmith vendor unlock
-#                                 the library lacks (without it control-point
-#                                 commands are refused with result 5), serves a
-#                                 JSON-lines control socket
-#   * packages.<system>.walkingpad-client
-#                                 pure-stdlib client CLI for that socket
-#   * nixosModules.default         services.walkingpad: the daemon as a
-#                                 systemd service with tight sandboxing
-#                                 (DynamicUser, AF_UNIX only), client on PATH
-#
-# Usage:
-#   nix develop                          # enter the dev shell
-#   nix build .#walkingpad-controller    # build the package alone
-#   nix run .#walkingpad-sandboxed -- scan
-#   nix run .#walkingpad-sandboxed -- info
-#   nix run .#walkingpad-sandboxed -- start --speed 3.0
-#   nix run .#walkingpad-sandboxed -- speed 4.0
-#   nix run .#walkingpad-sandboxed -- stop
-#
-# Inside the dev shell, iterate on the CLI source directly (no rebuild):
-#   python src/wp_cli.py scan
-#
-# Daemon + client (persistent link; connect/disconnect beeps happen once
-# per service start instead of once per command):
-#   nix run .#walkingpad-daemon -- --socket /tmp/walkingpad.sock
-#   nix run .#walkingpad-client -- --socket /tmp/walkingpad.sock status
-#   nix run .#walkingpad-client -- --socket /tmp/walkingpad.sock start --speed 3.0
-#   nix run .#walkingpad-client -- --socket /tmp/walkingpad.sock stop
-#
-# Or as a NixOS service (see nix/walkingpad-module.nix):
-#   services.walkingpad.enable = true;   # then: walkingpad-client status
-#
-# Requires nixpkgs >= 23.05 (pythonPackagesExtensions was introduced then).
+# WalkingPad daemon, socket client, GNOME extension, and development shell.
+# Run the client against the installed service: nix run . -- status
 
 {
   description = "walkingpad-controller (KingSmith WalkingPad BLE/FTMS control) dev shell";
@@ -60,65 +13,12 @@
       systems = [ "x86_64-linux" "aarch64-linux" ];
       forAllSystems = nixpkgs.lib.genAttrs systems;
 
-      # ------------------------------------------------------------------
-      # The module: a Nixpkgs overlay registering walkingpad-controller in
-      # the Python package sets.
-      #
-      # pythonPackagesExtensions is the mechanism the nixpkgs Python manual
-      # prescribes for extending *every* interpreter's package set
-      # (python3Packages, python312Packages, ...) from one place, so the
-      # package resolves regardless of which interpreter the consumer uses.
-      #
-      # callPackage on py-final resolves nix/walkingpad-controller.nix's
-      # arguments (bleak, bleak-retry-connector, buildPythonPackage,
-      # fetchurl, lib) from that same extended Python set.
-      # ------------------------------------------------------------------
-      walkingpadOverlay = final: prev: {
-        pythonPackagesExtensions = prev.pythonPackagesExtensions ++ [
-          (py-final: py-prev: {
-            walkingpad-controller = py-final.callPackage ./nix/walkingpad-controller.nix { };
-          })
-        ];
-      };
-
-      # Nixpkgs evaluated per system with the overlay applied, so that
-      # pkgs.python3Packages.walkingpad-controller resolves for the devShell.
-      pkgsFor = system: import nixpkgs {
-        inherit system;
-        overlays = [ walkingpadOverlay ];
-      };
+      pkgsFor = system: import nixpkgs { inherit system; };
     in
     {
-      # Exported so the same module can be consumed from a NixOS configuration:
-      #   nixpkgs.overlays = [ walkingpad-flake.overlays.default ];
-      overlays.default = walkingpadOverlay;
-
-      # The package in isolation, plus two conveniences:
-      #   walkingpad-cli       — small CLI (scan / info / start / speed / stop)
-      #                          built from the package
-      #   walkingpad-sandboxed — the CLI wrapped in a bubblewrap sandbox that
-      #                          bind-mounts the host's D-Bus system bus
-      #                          socket (the only interface needed; org.bluez
-      #                          lives on the host's system bus).
       packages = forAllSystems (system:
         let
           pkgs = pkgsFor system;
-
-          # The CLI. Note there is no "pairing" step for FTMS WalkingPads:
-          # the association model is unauthenticated Just Works, so connecting
-          # is pairing — no PIN, no stored bond, no KS Fit app required.
-          # Remember the single-client rule: the pad serves exactly one BLE
-          # connection, so no phone app may be attached when the CLI connects.
-          #
-          # The script lives in src/wp_cli.py at normal top-level
-          # indentation: editors and flake8 lint it directly, and inside the
-          # dev shell it runs without a rebuild. builtins.readFile splices it
-          # into the derivation, where writers still flake8-checks the text
-          # at build time.
-          walkingpad-cli = pkgs.writers.writePython3Bin "walkingpad" {
-            libraries = [ pkgs.python3Packages.walkingpad-controller ];
-            flakeIgnore = [ "E501" ];
-          } (builtins.readFile ./src/wp_cli.py);
 
           # The daemon. It deliberately does not use the
           # walkingpad-controller library: Z1-series firmware gates all FTMS
@@ -212,43 +112,7 @@
             '';
           };
 
-          # Keep the proxy outside the PID/network namespaces. Only its
-          # filtered socket is mounted inside the CLI sandbox.
-          walkingpad-sandboxed = pkgs.writeShellScriptBin "walkingpad-sandboxed" ''
-            set -euo pipefail
-            proxy_dir=$(${pkgs.coreutils}/bin/mktemp -d)
-            proxy_pid=
-            cleanup() {
-              if [ -n "$proxy_pid" ]; then
-                kill "$proxy_pid" 2>/dev/null || true
-                wait "$proxy_pid" 2>/dev/null || true
-              fi
-              ${pkgs.coreutils}/bin/rm -rf "$proxy_dir"
-            }
-            trap cleanup EXIT
-            trap 'exit 130' INT
-            trap 'exit 143' TERM
-            coproc BLUEZ_PROXY {
-              exec ${pkgs.xdg-dbus-proxy}/bin/xdg-dbus-proxy \
-                unix:path=/run/dbus/system_bus_socket "$proxy_dir/bus" \
-                --filter --talk=org.bluez --fd=1
-            }
-            proxy_pid=$!
-            read -r -N 1 -t 10 -u "''${BLUEZ_PROXY[0]:?D-Bus proxy exited before readiness}" ready
-            ${pkgs.bubblewrap}/bin/bwrap \
-              --unshare-all \
-              --die-with-parent \
-              --proc /proc \
-              --dev /dev \
-              --tmpfs /tmp \
-              --ro-bind /nix /nix \
-              --ro-bind "$proxy_dir/bus" /run/dbus/system_bus_socket \
-              --setenv DBUS_SYSTEM_BUS_ADDRESS unix:path=/run/dbus/system_bus_socket \
-              ${walkingpad-cli}/bin/walkingpad "$@"
-          '';
         in {
-          walkingpad-controller = pkgs.python3Packages.walkingpad-controller;
-          walkingpad-cli = walkingpad-cli;
           walkingpad-daemon = walkingpad-daemon;
           # The client with fish/bash/zsh completions merged in.
           walkingpad-client = pkgs.buildEnv {
@@ -256,9 +120,8 @@
             paths = [ walkingpad-client walkingpad-client-completions ];
           };
           walkingpad-gnome-extension = walkingpad-gnome-extension;
-          walkingpad-sandboxed = walkingpad-sandboxed;
           walkingpad-promo = walkingpad-promo;
-          default = walkingpad-sandboxed;
+          default = self.packages.${system}.walkingpad-client;
         });
 
       # NixOS module: services.walkingpad — the daemon as a systemd service
@@ -268,17 +131,13 @@
       # requiring the overlay on the host.
       nixosModules.default = import ./nix/walkingpad-module.nix self;
 
-      # The dev shell: mkShell wrapping a pythonEnv whose only extra package
-      # is the one the overlay provides; propagatedBuildInputs (bleak and
-      # friends) come along automatically through withPackages.
+      # Development needs the same BLE library as the daemon.
       devShells = forAllSystems (system:
         let
           pkgs = pkgsFor system;
 
-          # A self-contained interpreter with walkingpad-controller on
-          # sys.path — no venv, no pip.
           pythonEnv = pkgs.python3.withPackages (ps: [
-            ps.walkingpad-controller
+            ps.bleak
           ]);
         in
         {

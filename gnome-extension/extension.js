@@ -333,7 +333,15 @@ class WalkingPadIndicator extends QuickSettings.SystemIndicator {
         this._toggle.checked = target;
         if (target) {
             this._startCountdown();
-            this._link.command({cmd: 'start', speed: this._targetSpeed()});
+            this._link.command({cmd: 'start', speed: this._targetSpeed()}, reply => {
+                if (reply?.ok)
+                    return;
+                this._clearCountdown();
+                if (this._state)
+                    this._onState(this._state);
+                Main.notifyError('WalkingPad could not start',
+                    reply?.result_text ?? reply?.error ?? 'No response from daemon');
+            });
         } else {
             this._clearCountdown();
             this._clearPendingSpeed(true);
