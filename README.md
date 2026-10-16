@@ -1,3 +1,5 @@
+![WARN: LLM GENERATED](https://img.shields.io/badge/WARN-LLM%20GENERATED-FF6347)
+
 # walkingpad-controller
 
 Control your KingSmith WalkingPad from GNOME's Quick Settings and keep track
