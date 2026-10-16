@@ -12,7 +12,7 @@ const timers = new Map();
 let nextTimer = 1;
 const context = vm.createContext({
     TextDecoder, Date,
-    Gio: {}, Clutter: {}, St: {}, Main: {}, Extension: class {},
+    Gio: {}, Clutter: {}, St: {}, Main: {notifyError() {}}, Extension: class {},
     GLib: {
         PRIORITY_DEFAULT: 0, SOURCE_REMOVE: false,
         source_remove(id) { timers.delete(id); },
@@ -62,6 +62,25 @@ function history(revision = 0, currentDate = date(), steps = 16) {
         current: currentDate ? {date: currentDate, session: {steps, distance: 10, duration: 10}} : null};
 }
 function today(indicator) { return indicator._days.at(-1); }
+
+test('rejected start clears the countdown and reports the daemon error', () => {
+    const {indicator, commands} = setup();
+    indicator._onState(state({belt: 'stopped', speed: 0}));
+    indicator._startCountdown = () => { indicator._countdown = 3; };
+    const notifications = [];
+    const notify = context.Main.notifyError;
+    context.Main.notifyError = (...args) => notifications.push(args);
+    try {
+        indicator._onToggleClicked();
+        const start = commands.find(item => item.request.cmd === 'start');
+        start.callback({ok: false, result_text: 'failed'});
+        assert.equal(indicator._countdown, 0);
+        assert.equal(indicator._toggle.checked, false);
+        assert.deepEqual(notifications, [['WalkingPad could not start', 'failed']]);
+    } finally {
+        context.Main.notifyError = notify;
+    }
+});
 
 test('live counters update the bar and hovered caption without accumulating twice', () => {
     const {indicator, requests} = setup();

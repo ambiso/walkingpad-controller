@@ -8,7 +8,6 @@
 | --- | --- |
 | `src/wp_daemon.py` | BLE connection, control socket, and session accounting |
 | `src/wp_client.py` | Command-line client for the daemon |
-| `src/wp_cli.py` | Separate one-shot client using the upstream Python library |
 | `gnome-extension/` | GNOME Shell Quick Settings extension |
 | `nix/` and `flake.nix` | Packaging and the NixOS module |
 | `scripts/promo/` and `scripts/record-promo.py` | Isolated demo recording |
@@ -65,17 +64,3 @@ pad's Bluetooth address to the daemon command to select a specific pad. You
 must keep the daemon running yourself or configure your own service; this does
 not install or enable the GNOME extension. The extension expects the NixOS
 module's socket path, `/run/walkingpad/daemon.sock`.
-
-## Other packages
-
-`walkingpad-cli` (executable `walkingpad`) and `walkingpad-sandboxed` provide
-one-shot `scan`, `info`, `start`, `speed`, and `stop` commands using the upstream
-[walkingpad-controller](https://github.com/mcdax/walkingpad-controller) library.
-The sandboxed variant uses bubblewrap and exposes a filtered D-Bus socket
-that permits BlueZ access. Its proxy stays outside the sandbox and exits when
-the command finishes.
-The persistent daemon implements its own vendor unlock, so use it for the Z1
-control path described in the README; the library-based tools are separate.
-
-Fish, Bash, and Zsh completions for `walkingpad-client` are generated from its
-argparse parser at build time using shtab.

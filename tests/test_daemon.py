@@ -308,11 +308,43 @@ class ReconnectTests(unittest.IsolatedAsyncioTestCase):
 
 
 class CommandTests(unittest.IsolatedAsyncioTestCase):
+    async def test_start_wakes_sleeping_pad_and_preserves_other_mode_bits(self):
+        pad = make_pad()
+        pad.read_properties = AsyncMock(side_effect=[
+            [{"id": 10, "value": 0x0240}],
+            [{"id": 10, "value": 0x0200}],
+        ])
+        pad.write_property = AsyncMock(return_value=True)
+        pad.cp = AsyncMock(return_value=4)
+        self.assertEqual(await pad.cmd_start(), 4)
+        pad.write_property.assert_awaited_once_with(10, 0x0200)
+        pad.cp.assert_awaited_once_with(daemon.OP_START)
+
+    async def test_start_does_not_change_manual_or_auto_mode(self):
+        for value in (0x0200, 0x0220):
+            with self.subTest(value=value):
+                pad = make_pad()
+                pad.read_properties = AsyncMock(return_value=[{"id": 10, "value": value}])
+                pad.write_property = AsyncMock()
+                self.assertTrue(await pad.wake_for_start())
+                pad.write_property.assert_not_awaited()
+
+    async def test_start_is_not_sent_when_wake_fails(self):
+        for accepted in (False, True):
+            with self.subTest(accepted=accepted):
+                pad = make_pad()
+                pad.read_properties = AsyncMock(return_value=[{"id": 10, "value": 0x0240}])
+                pad.write_property = AsyncMock(return_value=accepted)
+                pad.cp = AsyncMock()
+                self.assertEqual(await pad.cmd_start(), 4)
+                pad.cp.assert_not_awaited()
+
     async def test_start_after_stop_without_status_notification(self):
         pad = make_pad()
         telemetry(pad)
         pad.on_status(None, b"\x02\x01")
         pad.cp = AsyncMock(return_value=1)
+        pad.read_properties = AsyncMock(return_value=[])
         await pad.cmd_start()
         telemetry(pad, 1, 2, 1)
         self.assertEqual(pad.sessions.live(), counters(1, 2, 1))
