@@ -225,8 +225,8 @@ class DaemonLink {
                     const [line] = in_.read_line_finish(res);
                     if (line !== null) {
                         const msg = JSON.parse(decoder.decode(line));
-                        if (msg && msg.state)
-                            this._onState(msg.state);
+                        // Only the watch stream supplies device state:
+                        // independent command replies can arrive out of order.
                         reply = msg;
                     }
                 } catch (e) {
@@ -260,6 +260,7 @@ class WalkingPadIndicator extends QuickSettings.SystemIndicator {
         this._sendingSpeed = false;
         this._countdown = 0;
         this._countdownTimeout = 0;
+        this._toggleRequest = 0;
 
         const gicon = Gio.icon_new_for_string(
             extensionDir + '/icons/walkingpad-symbolic.svg');
@@ -329,11 +330,14 @@ class WalkingPadIndicator extends QuickSettings.SystemIndicator {
     }
 
     _onToggleClicked() {
+        const request = ++this._toggleRequest;
         const target = !(this._running() || this._state?.starting || this._countdown > 0);
         this._toggle.checked = target;
         if (target) {
             this._startCountdown();
             this._link.command({cmd: 'start', speed: this._targetSpeed()}, reply => {
+                if (this._destroyed || request !== this._toggleRequest)
+                    return;
                 if (reply?.ok)
                     return;
                 this._clearCountdown();
@@ -729,6 +733,7 @@ class WalkingPadIndicator extends QuickSettings.SystemIndicator {
     _onWatchDown() {
         if (this._destroyed)
             return;
+        this._toggleRequest++;
         this._clearCountdown();
         this._clearPendingSpeed(true);
         this._state = null;

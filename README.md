@@ -95,8 +95,9 @@ through the daemon’s socket.
 ## Using the pad
 
 Turn on the WalkingPad toggle to start walking. The extension shows a 3–2–1
-countdown, then waits for the pad to report that it is moving. Use the slider
-to adjust speed and turn the toggle off to stop. While walking, the caption
+countdown, then waits for the pad to report that it is moving. An unconfirmed
+Start expires after eight seconds; turn the toggle off to cancel it sooner.
+Use the slider to adjust speed and turn the toggle off to stop. While walking, the caption
 shows session duration, steps, and distance; hover the chart for daily totals.
 When adjusting speed, the slider holds your requested value until the pad
 reports it, or returns to the reported speed after three seconds without confirmation.

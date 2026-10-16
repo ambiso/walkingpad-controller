@@ -45,7 +45,7 @@ function setup() {
     Object.assign(indicator, {
         _state: null, _days: [], _historyReply: null, _historyRevision: null,
         _historyRequest: 0, _sessionDate: null, _hoveredDay: -1,
-        _countdown: 0, _countdownTimeout: 0, _historyTimeout: 0,
+        _countdown: 0, _countdownTimeout: 0, _historyTimeout: 0, _toggleRequest: 0,
         _pendingSpeed: null, _speedTimeout: 0, _sendingSpeed: false,
         _speedRequest: null, _queuedSpeed: null, _lo: 1, _hi: 6, _slider: {value: 0.4},
         _chart: {queue_repaint() {}}, _caption: {}, _toggle: {}, _sliderItem: {}, _icon: {},
@@ -281,4 +281,51 @@ test('display timeout does not discard the latest unsent speed change', () => {
     first.callback({ok: true});
     assert.equal(commands.at(-1).request.speed, 5);
     assert.equal(indicator._pendingSpeed, null);
+});
+
+
+test('a rejected older Start cannot cancel a newer countdown', () => {
+    const {indicator, commands} = setup();
+    indicator._onState(state({belt: 'stopped', speed: 0}));
+    indicator._startCountdown = () => { indicator._countdown = 3; };
+    indicator._onToggleClicked();
+    const first = commands.find(item => item.request.cmd === 'start');
+    indicator._onToggleClicked(); // Stop
+    indicator._onToggleClicked(); // a new Start
+    first.callback({ok: false, error: 'superseded'});
+    assert.equal(indicator._countdown, 3);
+    assert.equal(indicator._toggle.checked, true);
+});
+
+test('command reply state cannot overwrite a newer watch update', () => {
+    const originalGio = context.Gio;
+    const states = [], replies = [];
+    let complete;
+    try {
+        context.Gio = {
+            UnixSocketAddress: {new() {}},
+            SocketClient: class {
+                connect_async(address, cancellable, callback) { callback(this, {}); }
+                connect_finish() {
+                    return {
+                        get_output_stream() { return {write_all() {}}; },
+                        get_input_stream() {}, close() {},
+                    };
+                }
+            },
+            DataInputStream: class {
+                read_line_async(priority, cancellable, callback) { complete = () => callback(this, {}); }
+                read_line_finish() { return [Buffer.from('{"ok":true,"state":{"speed":1}}')]; }
+            },
+        };
+        const link = new context.DaemonLink(state => states.push(state), () => {});
+        link.command({cmd: 'speed', speed: 3}, reply => replies.push(reply));
+        link._onState({speed: 3}); // newer watch notification
+        complete();
+        assert.deepEqual(states, [{speed: 3}]);
+        assert.equal(replies.length, 1);
+        assert.equal(replies[0].ok, true);
+    } finally {
+        context.Gio = originalGio;
+    }
 });

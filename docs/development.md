@@ -29,10 +29,12 @@ nix shell nixpkgs#xdg-dbus-proxy nixpkgs#dbus --command nix develop -c python -m
 ```
 
 Python tests exercise session accounting and command handling using mocked
-connections. Extension tests execute the history-update methods with actor and
+connections, including Stop priority, cancellation during wake and speed
+adjustment, offline Start expiry, late replies, and connection replacement.
+Extension tests execute the history-update methods with actor and
 socket stubs, including asynchronous replies, session finalization, live duration,
-and recovery around midnight. Cursor-motion tests check continuity at spline
-joins and the straight history sweep.
+recovery around midnight, and protection from stale command replies.
+Cursor-motion tests check continuity at spline joins and the straight history sweep.
 
 The [demo recorder](promo.md) exercises actual GNOME pointer interactions in a
 private desktop with a mocked daemon. It checks UI state and live totals during
