@@ -112,6 +112,11 @@ walkingpad-client stop
 walkingpad-client history --days 7
 ```
 
+Query no-load auto-stop with `walkingpad-client auto-stop`, or configure it with
+`walkingpad-client auto-stop on 30` / `auto-stop off`.
+This stops an unloaded belt; it is separate from the idle sleep timer.
+See [pad settings and verification limits](docs/pad-settings.md).
+
 `pause` keeps the session open; `stop` finalizes it. The CLI history shows totals
 for finalized sessions and lists the open session separately. The extension's
 chart includes live activity. History survives service restarts and reboots.
