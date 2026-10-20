@@ -561,6 +561,12 @@ class Pad:
                     self.cp_reply.pop(expected, None)
                 else:
                     self.vendor_reply = None
+                # A write can fail before we await its reply. break_link()
+                # may already have failed that future; consume it as well.
+                if not future.done():
+                    future.cancel()
+                elif not future.cancelled():
+                    future.exception()
 
         return await self.exchanges.submit(perform, priority)
 
@@ -1106,8 +1112,8 @@ async def amain():
         lambda reader, writer: handle_client(reader, writer, pad),
         path=args.socket)
     os.chmod(args.socket, 0o666)  # any local user may steer the belt
-    asyncio.create_task(pad.run())
-    async with server:
+    async with server, asyncio.TaskGroup() as tasks:
+        tasks.create_task(pad.run())
         await server.serve_forever()
 
 

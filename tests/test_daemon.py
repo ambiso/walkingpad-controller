@@ -3,6 +3,7 @@
 import argparse
 import asyncio
 import contextlib
+import gc
 import importlib.util
 import io
 import json
@@ -413,6 +414,19 @@ class CommandTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(finalized["history_revision"], reply["history_revision"] + 1)
 
 
+class ServiceTests(unittest.IsolatedAsyncioTestCase):
+    async def test_connection_loop_failure_terminates_the_server(self):
+        pad = make_pad()
+        pad.run = AsyncMock(side_effect=RuntimeError("connection loop failed"))
+        with tempfile.TemporaryDirectory() as directory:
+            args = argparse.Namespace(socket=str(Path(directory) / "daemon.sock"))
+            with patch.object(daemon, "parse_args", return_value=args):
+                with patch.object(daemon, "Pad", return_value=pad):
+                    with self.assertRaises(ExceptionGroup) as raised:
+                        await asyncio.wait_for(daemon.amain(), 1)
+        self.assertEqual(str(raised.exception.exceptions[0]), "connection loop failed")
+
+
 class SchedulerTests(unittest.IsolatedAsyncioTestCase):
     def wire_pad(self):
         pad = make_pad()
@@ -420,6 +434,29 @@ class SchedulerTests(unittest.IsolatedAsyncioTestCase):
         pad.client = AsyncMock()
         pad._paced = AsyncMock()
         return pad
+
+    async def test_write_failure_does_not_leave_an_unretrieved_reply_exception(self):
+        loop = asyncio.get_running_loop()
+        previous = loop.get_exception_handler()
+        errors = []
+        loop.set_exception_handler(lambda _loop, context: errors.append(context))
+        try:
+            for vendor in (False, True):
+                pad = self.wire_pad()
+                pad.client.write_gatt_char.side_effect = RuntimeError(
+                    "Service Discovery has not been performed yet")
+                with self.assertRaisesRegex(RuntimeError, "Service Discovery"):
+                    if vendor:
+                        await pad.read_properties()
+                    else:
+                        await pad.cp(daemon.OP_SET_SPEED)
+                self.assertFalse(pad.state["connected"])
+                del pad
+                await asyncio.sleep(0)
+                gc.collect()
+            self.assertEqual(errors, [])
+        finally:
+            loop.set_exception_handler(previous)
 
     async def test_stop_overtakes_unsent_work_even_during_pacing(self):
         pad = self.wire_pad()

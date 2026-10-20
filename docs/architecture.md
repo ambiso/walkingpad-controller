@@ -45,7 +45,9 @@ notification callbacks from older connection generations are discarded.
 
 The extension takes device state only from the watch socket. Command replies
 report results but cannot overwrite newer telemetry received on that stream.
-Replies to older toggle actions cannot cancel a newer countdown. Stop/pause
+Replies to older toggle actions cannot cancel a newer countdown. The toggle
+and speed slider share one full-width Quick Settings row, keeping the slider
+to the toggle's right regardless of surrounding tiles. Stop/pause
 notifications update observed belt state but do not invalidate newer user
 requests; an explicit Stop or Pause request cancels pending movement work.
 
@@ -54,6 +56,11 @@ have not yet been exercised on the physical pad. The successful auto-stop
 exchange is separately documented in [pad settings](pad-settings.md).
 
 ## Bluetooth access
+
+The connection loop and control-socket server are supervised together: an
+unexpected connection-loop failure terminates the process so systemd can
+restart it. The NixOS service restarts after both failed and clean process
+exits, with a five-second delay. An explicit systemd stop is still respected.
 
 The daemon also asks BlueZ to drop stale connections before discovery, since a
 stale link can prevent the pad from advertising. Connection beeps can recur when

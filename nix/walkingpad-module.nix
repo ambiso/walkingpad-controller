@@ -157,8 +157,9 @@ in
         );
 
         # The daemon reconnects to the pad internally (with delay);
-        # systemd only restarts when the process itself dies.
-        Restart = "on-failure";
+        # Restart after unexpected process exits, including clean exits.
+        # Explicit systemctl stops and system shutdown are still respected.
+        Restart = "always";
         RestartSec = 5;
 
         # -- sandbox ------------------------------------------------------

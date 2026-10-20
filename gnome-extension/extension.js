@@ -301,11 +301,14 @@ class WalkingPadIndicator extends QuickSettings.SystemIndicator {
             this._commitSpeed();
         });
         this._slider.connect('notify::value', () => this._onSliderValue());
-        // The slider comes first in the items list: the grid renders the
-        // second item in the left column, so this puts the WalkingPad
-        // toggle on the left and the speed slider on the right.
-        this.quickSettingsItems.push(this._sliderItem);
-        this.quickSettingsItems.push(this._toggle);
+        // One full-width grid item keeps the controls together even when
+        // other extensions leave an odd number of half-width tiles.
+        this._controls = new St.BoxLayout({x_expand: true, style: 'spacing: 12px;'});
+        this._controls.layout_manager.homogeneous = true;
+        this._toggle.x_expand = true;
+        this._sliderItem.x_expand = true;
+        this._controls.add_child(this._toggle);
+        this._controls.add_child(this._sliderItem);
 
         this._days = [];
         this._historyReply = null;
@@ -317,6 +320,7 @@ class WalkingPadIndicator extends QuickSettings.SystemIndicator {
         this._historyBox = this._buildHistogram();
 
         Main.panel.statusArea.quickSettings.addExternalIndicator(this);
+        Main.panel.statusArea.quickSettings.menu.addItem(this._controls, 2);
         // The histogram spans the full 2-column quick settings grid; as a
         // one-column item its fixed width would inflate every column (the
         // grid sizes columns to the widest child), skewing the layout.
@@ -761,8 +765,8 @@ class WalkingPadIndicator extends QuickSettings.SystemIndicator {
             GLib.source_remove(this._reconnectTimeout);
         if (this._historyTimeout)
             GLib.source_remove(this._historyTimeout);
-        this._toggle.destroy();
-        this._sliderItem.destroy();
+        this._sliderItem.menu.destroy();
+        this._controls.destroy();
         this._historyBox.destroy();
         super.destroy();
     }
