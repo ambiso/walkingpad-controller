@@ -504,6 +504,10 @@ class Pad:
             self.sessions.update(changes, walking)
             if walking and self.sessions.session is not None:
                 changes.update(belt="started", starting=False)
+            elif changes.get("speed") == 0 and self.state["belt"] == "started":
+                # Handle zero speed even without a separate stop notification.
+                # Zero proves no movement, but not a session boundary.
+                changes["belt"] = "stopped"
             changes.update(self.sessions.live())
             self._set(**changes)
 

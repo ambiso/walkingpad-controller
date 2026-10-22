@@ -127,6 +127,11 @@ ignored until a start or reset establishes the next session.
 If a `02` status frame omits its stop/pause parameter, the displayed belt state
 becomes stopped but accounting stays open until a known stop or counter reset.
 
+An explicit zero-speed telemetry sample also changes a previously started belt
+to stopped, even without a stop-status notification. This updates the extension's
+toggle and caption while retaining session totals. An explicit pause remains
+paused; telemetry without a speed field does not imply a stop.
+
 These are implemented parser behaviors, covered by mocked tests. In particular,
 the safety-stop test injects a `03` frame; it does not demonstrate that the
 KS-HD-Z1E actually emits one. There is no hardware trace in this repository

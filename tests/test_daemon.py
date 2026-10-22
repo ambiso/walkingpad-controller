@@ -225,6 +225,26 @@ class NotificationTests(unittest.TestCase):
         telemetry(self.pad, 101, 152, 81)
         self.assertEqual(self.pad.sessions.live(), counters(101, 152, 81))
 
+    def test_zero_speed_without_stop_status_updates_watch_and_preserves_session(self):
+        updates = asyncio.Queue()
+        self.pad.watchers.add(updates)
+        # Speed-only telemetry: no fabricated counter reset or stop status.
+        self.pad.on_data(None, b"\x00\x00\x00\x00")
+        state = updates.get_nowait()
+        self.assertEqual(state["speed"], 0)
+        self.assertEqual(state["belt"], "stopped")
+        self.assertEqual(self.pad.sessions.live(), counters())
+        self.assertIsNotNone(self.pad.sessions.session)
+        self.assertEqual(self.pad.sessions.read(), [])
+        telemetry(self.pad, 101, 152, 81)
+        self.assertEqual(self.pad.state["belt"], "started")
+        self.assertEqual(self.pad.sessions.live(), counters(101, 152, 81))
+
+    def test_zero_speed_preserves_explicit_pause(self):
+        self.pad.on_status(None, b"\x02\x02")
+        self.pad.on_data(None, b"\x00\x00\x00\x00")
+        self.assertEqual(self.pad.state["belt"], "paused")
+
     def test_missing_pause_parameter_preserves_session_until_reset(self):
         self.pad.on_status(None, b"\x02")
         self.assertIsNotNone(self.pad.sessions.session)
