@@ -54,7 +54,7 @@ also tested; they introduced stalls and cursor artifacts in this setup.
 The cropped asset is encoded separately for a small file.
 The log records animation and capture frame intervals during the history tour. No WalkingPad
 or running desktop session is needed. The Nix package supplies the tools;
-it has been exercised with GNOME Shell 50.
+it has been exercised with GNOME Shell 50 and 51.
 
 The driver is `scripts/record-promo.py`; cursor choreography and mock
 telemetry live in `scripts/promo/`. Use `--fps` to change the output frame

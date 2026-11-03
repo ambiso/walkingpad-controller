@@ -3,3 +3,5 @@ result
 result-*
 __pycache__/
 *.pyc
+issues.md
+walkingpad-gnome-diagnostics.txt

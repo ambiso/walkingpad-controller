@@ -544,10 +544,12 @@ class WalkingPadIndicator extends QuickSettings.SystemIndicator {
         }
 
         const box = new St.BoxLayout({
-            vertical: true,
             x_expand: true,
             style: 'padding: 10px 12px 8px 12px;',
         });
+        // The layout manager works across 45–51; St.BoxLayout.vertical was
+        // removed in 51, while St.BoxLayout.orientation is absent in 45.
+        box.layout_manager.orientation = Clutter.Orientation.VERTICAL;
         box.add_child(this._chart);
         box.add_child(this._caption);
         box.add_child(weekdayRow);

@@ -12,7 +12,8 @@ function installPromo(indicator, directory) {
         cr.$dispose();
     });
     Main.layoutManager._backgroundGroup.add_child(background);
-    const pointer = Clutter.get_default_backend().get_default_seat()
+    const backend = global.stage.context?.get_backend() ?? Clutter.get_default_backend();
+    const pointer = backend.get_default_seat()
         .create_virtual_device(Clutter.InputDeviceType.POINTER_DEVICE);
     const cursor = new St.Icon({
         gicon: new Gio.FileIcon({file: Gio.File.new_for_path(`${directory}/cursor.svg`)}),
@@ -159,7 +160,7 @@ function installPromo(indicator, directory) {
             // Keep the panel clock from being cut in half by the camera crop.
             Main.panel.statusArea.dateMenu.opacity = 0;
             // Eval is enabled only in this private shell; hide its warning icon.
-            Main.panel.statusArea.quickSettings._unsafeMode.hide();
+            Main.panel.statusArea.quickSettings._unsafeMode?.hide();
             for (const source of Main.messageTray.getSources())
                 source.destroy();
             // Critical startup banners bypass the notification preference.

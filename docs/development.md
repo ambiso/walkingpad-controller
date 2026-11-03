@@ -40,9 +40,11 @@ The [demo recorder](promo.md) exercises actual GNOME pointer interactions in a
 private desktop with a mocked daemon. It checks UI state and live totals during
 the tour. These checks do not establish how real hardware behaves.
 
-The extension declares support for GNOME Shell 45–50 in `metadata.json`.
-The demo recording has been exercised with GNOME Shell 50; this is not a test
-of every declared version.
+The extension declares support for GNOME Shell 45–51 in `metadata.json`.
+The demo recording has been exercised with GNOME Shell 50 and 51; this is not
+a test of every declared version. The histogram sets orientation on its layout
+manager because the `St.BoxLayout.vertical` convenience property was removed
+in GNOME 51, while `St.BoxLayout.orientation` is unavailable in GNOME 45.
 
 ## Running without the NixOS module
 
