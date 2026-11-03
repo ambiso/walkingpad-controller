@@ -160,6 +160,26 @@ class SessionTests(unittest.TestCase):
         self.sessions.finish()
         self.assertEqual(self.sessions.read()[0]["steps"], 5)
 
+    def test_sessions_are_dated_by_start_across_restart(self):
+        day = 24 * 3600
+        with patch.object(daemon.time, "time", return_value=1_000_000_000):
+            self.sessions.update(counters(), True)
+        with patch.object(daemon.time, "time", return_value=1_000_000_000 + day):
+            recovered = daemon.Sessions(self.path)
+            self.assertEqual(recovered.current()["date"], daemon.local_date(1_000_000_000))
+            recovered.update(counters(0, 0, 0), False)  # counters reset
+        record = recovered.read()[0]
+        self.assertEqual(record["start"], 1_000_000_000)
+        self.assertEqual(record["date"], daemon.local_date(1_000_000_000))
+
+    def test_snapshot_without_start_is_dated_by_last_update(self):
+        Path(self.sessions.current_path).write_text(json.dumps({
+            "ts": 1_000_000_000, "date": "ignored",
+            "session": {"distance": 80, "duration": 100, "steps": 150},
+            "prev": counters()}))
+        recovered = daemon.Sessions(self.path)
+        self.assertEqual(recovered.current()["date"], daemon.local_date(1_000_000_000))
+
     def test_history_reply_uses_current_memory_not_throttled_snapshot(self):
         self.sessions.update(counters(), True)
         self.sessions.update(counters(101, 152, 81), True)

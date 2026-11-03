@@ -94,10 +94,15 @@ at startup and resolved by subsequent telemetry, including idle telemetry.
 Recent activity after the last snapshot can be lost in an unclean shutdown.
 Accounting continues when persistence is disabled.
 
-The CLI groups finalized records by their recorded local date and displays the
-open session separately. The histogram adds the open session to its cached daily
-totals and updates with live telemetry. Finalized records use the local date at
-finalization; records are not split into individual days at midnight.
+Each session is dated by the local date of its first walking sample. Its start
+time is kept in the snapshot, so a session finalized on a later day, for example
+after a stop the pad did not report, still counts toward the day it began.
+Snapshots written before start times were recorded fall back to their last
+update time. Records are not split into individual days at midnight.
+
+The CLI groups finalized records by that date and displays the open session
+separately. The histogram adds the open session to its day's cached totals and
+updates with live telemetry.
 
 ## Gaps and session identity
 
@@ -131,6 +136,10 @@ An explicit zero-speed telemetry sample also changes a previously started belt
 to stopped, even without a stop-status notification. This updates the extension's
 toggle and caption while retaining session totals. An explicit pause remains
 paused; telemetry without a speed field does not imply a stop.
+
+In use, sessions ended by the pad's idle sleep, and apparently by the physical
+remote, stayed open until the counter reset on the next start finalized them.
+No Bluetooth trace yet shows which status frames, if any, the pad sent then.
 
 These are implemented parser behaviors, covered by mocked tests. In particular,
 the safety-stop test injects a `03` frame; it does not demonstrate that the

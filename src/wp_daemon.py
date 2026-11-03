@@ -179,6 +179,10 @@ def parse_telemetry(data):
     return values
 
 
+def local_date(timestamp):
+    return time.strftime("%Y-%m-%d", time.localtime(timestamp))
+
+
 class Sessions:
     """Session deltas and optional persistence; raw counters stay internal."""
 
@@ -189,6 +193,7 @@ class Sessions:
         self.failed = False
         self.last_flush = 0.0
         self.session = None
+        self.started = None  # epoch seconds of the session's first sample
         self.previous = {}
         self.stopped = False
         self.revision = 0
@@ -205,7 +210,13 @@ class Sessions:
                 if any(type(value) is not int or not 0 <= value <= PAD_TO_RECORD[field][1]
                        for field, value in previous.items()):
                     return
+                # Snapshots without a start time predate it; their last-update
+                # time is the closest available estimate.
+                started = snapshot.get("start", snapshot.get("ts"))
+                if type(started) is not int:
+                    return
                 self.session = {field: session[field] for field in RESET_THRESHOLD}
+                self.started = started
                 self.previous = previous
             except (OSError, ValueError, KeyError, TypeError):
                 pass
@@ -231,6 +242,7 @@ class Sessions:
             if not walking:
                 return
             self.session = dict.fromkeys(RESET_THRESHOLD, 0)
+            self.started = int(time.time())
         for field, (record, mask) in PAD_TO_RECORD.items():
             if field in counters:
                 old = self.previous.get(field, 0)
@@ -251,12 +263,14 @@ class Sessions:
     def current(self):
         if self.session is None:
             return None
-        return {"ts": int(time.time()), "date": time.strftime("%Y-%m-%d"),
+        return {"ts": int(time.time()), "start": self.started,
+                "date": local_date(self.started),
                 "session": dict(self.session), "prev": dict(self.previous)}
 
     def finish(self):
         self.stopped = True
         session, self.session = self.session, None
+        started, self.started = self.started, None
         self.last_flush = 0.0
         if session is None:
             return
@@ -268,8 +282,8 @@ class Sessions:
             if any(session.values()):
                 os.makedirs(self.directory, exist_ok=True)
                 with open(self.path, "a", encoding="utf-8") as fh:
-                    record = {"ts": int(time.time()), "date": time.strftime("%Y-%m-%d"),
-                              "reason": "stop", **session}
+                    record = {"ts": int(time.time()), "start": started,
+                              "date": local_date(started), "reason": "stop", **session}
                     fh.write(json.dumps(record) + "\n")
             # Remove even a zero-session snapshot, so it cannot be recovered.
             if os.path.exists(self.current_path):
